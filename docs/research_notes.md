@@ -98,3 +98,24 @@ Qwen3.5 使用 Gated DeltaNet 线性注意力与 Gated Attention 的混合栈，
 - llama.cpp 当前提供 `--n-cpu-ffn`、`--override-tensor` 和 eval callback；后续原型可先用现有 CPU/GPU 张量放置和 callback 做注入，不必立即重写调度器。
 
 本轮实验决策：先实现输入 `x` 的局部低秩模型和 OOD 回退，优先验证 layer 23；layer 22 作为负对照。只有在混合路径的模型级 KL 和实际 callback 时间可接受时，才进入图执行器改造。
+
+## 2026-09-02 计划收敛
+
+用户确认降低目标难度：当前不追求全模型统一公式，也不追求复杂的跨层合并。研究主线改为：
+
+```text
+每层权重/布局预展开到 RAM
+        -> CPU 路由与系数生成
+        -> GPU 计算少量残差
+        -> 本层内轻量 base + residual 合并
+        -> 超阈值时整层精确回退
+```
+
+“分层合并”只要求本层输出正确进入下一层，不要求建立额外的跨层状态协议；KV cache 以及后续长上下文问题后置。这样首要优化目标变成 H2D 字节、显存峰值、GPU 空转和 CPU 路由开销之间的平衡。
+
+当前优先级：
+
+1. layer 23 单层真实 callback/replay。
+2. layer 22 负对照，确认按层选择必要性。
+3. 连续 token 的超级块合并和 pinned ring buffer。
+4. 只扩展到少量稳定层，验证串联 KL 和吞吐。
