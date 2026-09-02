@@ -1,0 +1,30 @@
+# Large local experiment assets. Keep the files on disk, but out of Git.
+models/**
+runtime/**
+data/raw/**
+data/cache/**
+data/outputs/**
+*.gguf
+*.safetensors
+*.bin
+*.dll
+*.exe
+*.pt
+*.pth
+
+# Python and local tooling
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# Generated experiment outputs
+results/**/*.json
+results/**/*.csv
+results/**/*.npz
+results/**/*.txt
+logs/*.log
+
+# Local machine metadata
+.DS_Store
+Thumbs.db
