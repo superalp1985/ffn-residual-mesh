@@ -68,6 +68,16 @@ Qwen3.5 使用 Gated DeltaNet 线性注意力与 Gated Attention 的混合栈，
 - LUT-LLM、T-MAC 和 FLUTE 说明离线查表、位打包和权重布局会影响实际吞吐。
 - MemoryLLM 说明只有经过特殊训练的 context-free FFN 才适合直接做 token 级静态查表。
 
+## 2026-09-02 二次调研与实验决策
+
+本轮先查了 LUT-LLM、FLUTE 和 TARDIS，再决定实验方向：
+
+- LUT-LLM 已把向量量化、中心搜索、二维表和空间/时间缓存作为完整硬件路径；本项目不重复实现通用 LUT-GEMM，而把重点放在 CPU 分类、GPU 残差回退和 Windows 式超级块搬运的组合。
+- FLUTE 的离线重排、查表复制和向量化说明“预展开”必须包含布局与缓存副本，而不是只保存数学公式。
+- TARDIS 与本项目的局部线性残差最接近：常见输入区间走线性近似，离群输入在线回退精确 FFN。它主要验证了“分段线性 + 回退”的方向，但 Qwen3.5 使用并行 SiLU 门控，误差需要单独实测。
+
+这三项工作把本项目的差异收敛为：不训练新模型，针对现成 Qwen3.5 GGUF 做离线状态表；运行时用 CPU 路由和块目录决定是否只搬运小残差；每层独立选择 lookup、低秩残差或完整 FFN。
+
 ## 参考来源
 
 - Geva et al., Transformer Feed-Forward Layers Are Key-Value Memories.

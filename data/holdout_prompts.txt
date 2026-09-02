@@ -1,0 +1,4 @@
+Explain how to prepare a quarterly sales-tax filing when invoices, refunds, and payments occur in different months.
+Give a debugging checklist for a service that accepts TCP connections but intermittently returns HTTP 504 errors.
+Compare row-store and column-store databases for monthly reporting and analytical queries.
+Describe how to validate a quantized language model with a fixed regression set before deployment.
