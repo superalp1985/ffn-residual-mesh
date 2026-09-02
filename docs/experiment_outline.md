@@ -12,7 +12,7 @@
 4. 逻辑分页加超级块搬运是否能降低有效 PCIe 流量和同步次数。
 5. 在误差受控时，端到端推理是否比完整 GPU FFN 更快或更省显存。
 
-当前试验模型是 Qwen3.5 2B Q4_K_M。GGUF 元数据显示它是 `qwen35` 混合结构，24 层、hidden size 2048、FFN intermediate size 6144，并包含 SSM/线性注意力张量；因此首轮 FFN 实验要按层记录 Attention/SSM 类型，不能假设所有 block 相同。
+当前试验模型是 Qwen3.5 2B Q4_K_M。GGUF 元数据显示它是 `qwen35` 混合结构，24 层、hidden size 2048、FFN intermediate size 6144，并包含 SSM/线性注意力张量；因此首轮 FFN 实验要按层记录 Attention/SSM 类型，不能假设所有 block 相同。离线布局扫描显示该模型 FFN 张量约占 GGUF 文件 43.20%（523.13 MiB），不是纯 Transformer 中常见的参数占比，后续收益估算必须使用实测占比。
 
 ## 2. 工作假设
 
