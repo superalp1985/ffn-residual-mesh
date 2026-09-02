@@ -19,11 +19,15 @@ __pycache__/
 .pytest_cache/
 
 # Generated experiment outputs
+results/**
 results/**/*.json
 results/**/*.csv
 results/**/*.npz
 results/**/*.txt
 logs/*.log
+
+# Vendored local runtimes/source snapshots
+vendor/**
 
 # Local machine metadata
 .DS_Store
