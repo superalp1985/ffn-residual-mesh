@@ -87,3 +87,14 @@ Qwen3.5 使用 Gated DeltaNet 线性注意力与 Gated Attention 的混合栈，
 - T-MAC, CPU-Friendly Low-Bit LLM Inference with Table Lookup.
 - FLUTE, Flexible Lookup Table Engine for Accelerating DNN Inference.
 - MemoryLLM, Towards Self-Updatable Large Language Models.
+
+## 2026-09-02 三次调研与实验决策
+
+本轮在实现输入侧低秩残差前再次核对公开路线：
+
+- PowerInfer（arXiv:2312.12456）采用热神经元 GPU 常驻、冷神经元 CPU 计算，并强调激活局部性和自适应预测器；这支持“CPU 分类 + GPU 小子集”的系统形态，但不证明 dense FFN 可被静态表完整替换。
+- FlexGen（arXiv:2303.06865）将 GPU、CPU、磁盘视为统一资源并搜索张量存取计划；本项目的超级块、预取和双缓冲应沿这个方向建模，而不能只看理论字节数。
+- T-MAC（arXiv:2407.00088）与 LUT-NN（arXiv:2302.03213）分别验证了低比特矩阵乘的 CPU 查表，以及“中心 + 预计算输出”的通用算子查表；两者都依赖离线布局/中心学习，且 LUT-NN 的端到端结果来自训练适配模型，不能直接外推到未再训练的 Qwen3.5。
+- llama.cpp 当前提供 `--n-cpu-ffn`、`--override-tensor` 和 eval callback；后续原型可先用现有 CPU/GPU 张量放置和 callback 做注入，不必立即重写调度器。
+
+本轮实验决策：先实现输入 `x` 的局部低秩模型和 OOD 回退，优先验证 layer 23；layer 22 作为负对照。只有在混合路径的模型级 KL 和实际 callback 时间可接受时，才进入图执行器改造。
