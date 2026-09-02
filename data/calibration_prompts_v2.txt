@@ -1,0 +1,41 @@
+Explain how a small business should separate cash flow, revenue recognition, and inventory accounting in a monthly close.
+Describe a reliable method for reconciling bank statements, accounts receivable, and accounts payable at month end.
+What are the main causes of inventory shrinkage, and how should a retailer measure and control them?
+Compare cash accounting and accrual accounting for a small service company with examples.
+Give a step-by-step plan for designing a household budget with irregular income and recurring bills.
+Explain the difference between a balance sheet, an income statement, and a cash flow statement.
+How should a software team investigate a production latency regression after a routine deployment?
+Write a concise checklist for reviewing a Python pull request that changes database access code.
+Explain why a TCP connection can be established while an application request still times out.
+Compare optimistic and pessimistic concurrency control in a transactional database.
+Describe a practical experiment for measuring whether a cache improves end-to-end latency.
+Explain how gradient descent updates model parameters and why learning-rate schedules matter.
+Summarize the tradeoffs between CPU and GPU execution for a memory-bandwidth-bound matrix operation.
+How can a data pipeline detect schema drift without silently corrupting downstream tables?
+Explain the difference between lossy and lossless compression and when each is appropriate.
+Design a simple test plan for verifying that a model quantization change preserves output quality.
+Explain how deferred revenue should be recognized for an annual subscription paid in advance.
+How should a company estimate bad-debt expense when customer payment behavior changes?
+Compare FIFO and weighted-average inventory costing when purchase prices are rising.
+Describe controls that reduce duplicate vendor payments in an accounts-payable workflow.
+What information belongs in a monthly management report for a small manufacturing business?
+Explain how to distinguish a software bug from a database lock contention problem.
+Give a method for tracing a memory leak in a long-running Python worker.
+Why can reducing batch size improve latency but reduce total throughput?
+Compare REST and message-queue integration for processing asynchronous business events.
+How should a team design idempotency keys for a payment API?
+Explain how a B-tree index affects writes, reads, and storage costs.
+Describe a safe migration plan for adding a non-null column to a large production table.
+What metrics reveal that a GPU kernel is limited by memory bandwidth rather than arithmetic throughput?
+Explain why quantization error can concentrate in a small number of channels.
+Compare per-tensor, per-channel, and per-group scaling for low-bit matrix multiplication.
+Describe how to build a calibration set that covers both common and out-of-distribution requests.
+How can an inference runtime overlap host-to-device copies with GPU computation?
+Explain why a lookup table can be fast for repeated values but inaccurate for unseen values.
+Design a fallback policy for an approximate neural-network operator with a strict error budget.
+How should a benchmark separate cold-start cost from steady-state token latency?
+Describe a method for measuring PCIe transfer waste when requests touch sparse blocks.
+Explain why contiguous block layout matters for DMA and cache prefetching.
+Compare exact matrix multiplication with low-rank residual correction for a dense layer.
+How can a runtime choose different approximation formulas for different neural-network layers?
+What evidence would falsify the claim that a feed-forward layer has useful local state structure?

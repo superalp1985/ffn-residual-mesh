@@ -1,0 +1,8 @@
+Explain how to prepare a quarterly sales-tax filing when invoices, refunds, and payments occur in different months.
+Give a debugging checklist for a service that accepts TCP connections but intermittently returns HTTP 504 errors.
+Compare row-store and column-store databases for monthly reporting and analytical queries.
+Describe how to validate a quantized language model with a fixed regression set before deployment.
+Explain how to account for customer deposits that may be refunded or converted into sales later.
+What steps can a small company take to detect unauthorized changes to payroll records?
+Compare a write-through cache and a write-back cache for a transactional application.
+How should a team test whether asynchronous prefetching actually hides transfer latency?
