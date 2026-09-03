@@ -203,3 +203,14 @@ tail(x) = ||alpha(x) - TopK(alpha(x))||_2
 用校准分位数设置阈值后，layer 23 可在约 97--99% token 走近似路径时保持约 2.66--2.68% 的留出误差代理，并把期望 down 权重搬运降到约 0.08--0.23 MiB/token。layer 22 即使全近似也约 7.7%，必须回退。
 
 以上 H2D 数字是流量代理，不代表 llama.cpp 已实现；下一阶段必须用连续 token、超级块和 pinned ring buffer 测真实 DMA、同步和 kernel 时间。
+
+## 2026-09-03 Chebyshev 基底扫描
+
+monomial degree=4 在部分层上存在区间外数值放大。将标准化 gate 限制到 `[-B,B]`，并用 Chebyshev 递推拟合后，layer 23 和 layer 22 的留出误差均明显下降，但最优 `B` 不同，因此参数必须逐层记录：
+
+```text
+layer 23: degree=5, B=5
+layer 22: degree=4, B=6
+```
+
+这不是对所有层都适用的全局公式，而是“每层选择算子”的证据。Chebyshev 只改变基础非线性展开，不改变残差、top-k 或精确回退协议。
