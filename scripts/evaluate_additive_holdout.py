@@ -5,7 +5,6 @@ import json
 from pathlib import Path
 
 import numpy as np
-from sklearn.cluster import MiniBatchKMeans
 
 
 def load_tensor(root: Path, item: dict) -> np.ndarray:
@@ -34,6 +33,8 @@ def metrics(pred: np.ndarray, target: np.ndarray) -> dict[str, float]:
 
 
 def fit(values: np.ndarray, targets: np.ndarray, block_dim: int, k: int, seed: int) -> dict:
+    from sklearn.cluster import MiniBatchKMeans
+
     n, dim = values.shape
     centers, codes = [], []
     for j, start in enumerate(range(0, dim, block_dim)):
