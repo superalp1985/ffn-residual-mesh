@@ -7,6 +7,8 @@ from pathlib import Path
 import numpy as np
 
 from evaluate_polynomial_base_residual import (
+    chebyshev_base,
+    fit_chebyshev,
     fit_poly,
     fit_residual_map,
     load_down,
@@ -50,6 +52,8 @@ def main() -> None:
     parser.add_argument("--keeps", default="4,8,16,32")
     parser.add_argument("--quantiles", default="0.50,0.75,0.90,0.95,0.99,1.00")
     parser.add_argument("--residual-target", choices=("exact", "capture"), default="capture")
+    parser.add_argument("--base-basis", choices=("monomial", "chebyshev"), default="monomial")
+    parser.add_argument("--chebyshev-bound", type=float, default=6.0)
     parser.add_argument("--ridge", type=float, default=1e-2)
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
@@ -61,9 +65,14 @@ def main() -> None:
     train_target = train_exact_y if args.residual_target == "exact" else train_capture_y
     test_target = test_exact_y if args.residual_target == "exact" else test_capture_y
 
-    poly = fit_poly(train_g, train_u, train_h, args.base_degree, args.ridge)
-    base_train = poly_base(train_g, train_u, poly) @ down.T
-    base_test = poly_base(test_g, test_u, poly) @ down.T
+    if args.base_basis == "chebyshev":
+        poly = fit_chebyshev(train_g, train_u, train_h, args.base_degree, args.chebyshev_bound, args.ridge)
+        base_train = chebyshev_base(train_g, train_u, poly) @ down.T
+        base_test = chebyshev_base(test_g, test_u, poly) @ down.T
+    else:
+        poly = fit_poly(train_g, train_u, train_h, args.base_degree, args.ridge)
+        base_train = poly_base(train_g, train_u, poly) @ down.T
+        base_test = poly_base(test_g, test_u, poly) @ down.T
     residual_model = fit_residual_map(
         train_x,
         train_target - base_train,
@@ -118,6 +127,8 @@ def main() -> None:
         },
         "layer": args.layer,
         "base_degree": args.base_degree,
+        "base_basis": args.base_basis,
+        "chebyshev_bound": args.chebyshev_bound if args.base_basis == "chebyshev" else None,
         "input_rank": args.input_rank,
         "output_rank": output_rank,
         "feature_degree": args.feature_degree,

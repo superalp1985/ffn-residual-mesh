@@ -44,12 +44,41 @@ def fit_poly(g: np.ndarray, u: np.ndarray, h: np.ndarray, degree: int, ridge: fl
     return {"mu": mu, "sigma": sigma, "coeff": coeff, "degree": degree}
 
 
+def chebyshev_terms(z: np.ndarray, degree: int, bound: float) -> np.ndarray:
+    t = np.clip(z / np.float32(bound), -1.0, 1.0)
+    terms = [np.ones_like(t, dtype=np.float32)]
+    if degree >= 1:
+        terms.append(t)
+    for _ in range(2, degree + 1):
+        terms.append((2.0 * t * terms[-1] - terms[-2]).astype(np.float32, copy=False))
+    return np.stack(terms, axis=2)
+
+
+def fit_chebyshev(g: np.ndarray, u: np.ndarray, h: np.ndarray, degree: int, bound: float, ridge: float) -> dict:
+    mu = g.mean(axis=0).astype(np.float32)
+    sigma = np.maximum(g.std(axis=0).astype(np.float32), np.float32(1e-3))
+    z = (g - mu) / sigma
+    terms = chebyshev_terms(z, degree, bound)
+    coeff = np.zeros((g.shape[1], degree + 1), dtype=np.float32)
+    eye = np.eye(degree + 1, dtype=np.float32) * ridge
+    for j in range(g.shape[1]):
+        phi = u[:, j, None] * terms[:, j, :]
+        coeff[j] = np.linalg.solve(phi.T @ phi + eye, phi.T @ h[:, j])
+    return {"mu": mu, "sigma": sigma, "coeff": coeff, "degree": degree, "bound": bound}
+
+
 def poly_base(g: np.ndarray, u: np.ndarray, model: dict) -> np.ndarray:
     z = (g - model["mu"]) / model["sigma"]
     out = np.zeros_like(g, dtype=np.float32)
     for p in range(int(model["degree"]) + 1):
         out += model["coeff"][:, p][None, :] * u * (z ** p)
     return out
+
+
+def chebyshev_base(g: np.ndarray, u: np.ndarray, model: dict) -> np.ndarray:
+    z = (g - model["mu"]) / model["sigma"]
+    terms = chebyshev_terms(z, int(model["degree"]), float(model["bound"]))
+    return np.sum(u[:, :, None] * terms * model["coeff"][None, :, :], axis=2).astype(np.float32, copy=False)
 
 
 def residual_features(z: np.ndarray, feature_degree: int) -> np.ndarray:
@@ -104,6 +133,8 @@ def main() -> None:
     parser.add_argument("--output-ranks", default="8,16,32,64")
     parser.add_argument("--feature-degrees", default="1,2")
     parser.add_argument("--residual-target", choices=("exact", "capture"), default="exact")
+    parser.add_argument("--base-basis", choices=("monomial", "chebyshev"), default="monomial")
+    parser.add_argument("--chebyshev-bound", type=float, default=6.0)
     parser.add_argument("--ridge", type=float, default=1e-2)
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
@@ -114,8 +145,12 @@ def main() -> None:
     train_exact_y, test_exact_y = train_h @ down.T, test_h @ down.T
     rows = []
     for degree in [int(v) for v in args.degrees.split(",") if v.strip()]:
-        poly = fit_poly(train_g, train_u, train_h, degree, args.ridge)
-        base_h_train, base_h_test = poly_base(train_g, train_u, poly), poly_base(test_g, test_u, poly)
+        if args.base_basis == "chebyshev":
+            poly = fit_chebyshev(train_g, train_u, train_h, degree, args.chebyshev_bound, args.ridge)
+            base_h_train, base_h_test = chebyshev_base(train_g, train_u, poly), chebyshev_base(test_g, test_u, poly)
+        else:
+            poly = fit_poly(train_g, train_u, train_h, degree, args.ridge)
+            base_h_train, base_h_test = poly_base(train_g, train_u, poly), poly_base(test_g, test_u, poly)
         base_y_train, base_y_test = base_h_train @ down.T, base_h_test @ down.T
         residual_target_train = train_exact_y if args.residual_target == "exact" else train_capture_y
         residual_target_test = test_exact_y if args.residual_target == "exact" else test_capture_y
@@ -156,7 +191,11 @@ def main() -> None:
                             "full_down_weight_bytes_q4": down_bytes,
                         },
                         "extra_arithmetic": {
+                            "cpu_gate_projection_mac": int(train_x.shape[1] * train_h.shape[1]),
+                            "cpu_up_projection_mac": int(train_x.shape[1] * train_h.shape[1]),
                             "cpu_base_down_mac": int(train_h.shape[1] * down.shape[0]),
+                            "cpu_base_total_projection_mac": int(3 * train_x.shape[1] * train_h.shape[1]),
+                            "cpu_base_elementwise_mul": int(train_h.shape[1] * max(degree, 0)),
                             "cpu_residual_projection_mac": int(train_x.shape[1] * input_rank),
                             "cpu_residual_feature_mul": int(input_rank * max(feature_degree - 1, 0)),
                             "gpu_residual_merge_mac": int(down.shape[0] * output_rank),
@@ -164,7 +203,11 @@ def main() -> None:
                     })
     result = {
         "experiment": "polynomial_base_plus_residual_coefficients",
-        "formula": "y = W_down @ [u * p((g-mu)/sigma)] + U_r @ alpha(phi(P.T @ (x-mu)))",
+        "formula": (
+            "y = W_down @ [u * p((g-mu)/sigma)] + U_r @ alpha(phi(P.T @ (x-mu)))"
+            if args.base_basis == "monomial"
+            else "y = W_down @ [u * T((g-mu)/(sigma*bound))] + U_r @ alpha(phi(P.T @ (x-mu)))"
+        ),
         "runtime_properties": {
             "lookup": False,
             "runtime_silu": False,
@@ -173,6 +216,8 @@ def main() -> None:
             "purpose": "explicitly trade CPU/GPU arithmetic for lower per-token H2D traffic",
         },
         "layer": args.layer,
+        "base_basis": args.base_basis,
+        "chebyshev_bound": args.chebyshev_bound if args.base_basis == "chebyshev" else None,
         "residual_target": args.residual_target,
         "train_samples": len(train_g),
         "holdout_samples": len(test_g),
