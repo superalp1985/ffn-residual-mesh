@@ -102,6 +102,8 @@ def main() -> None:
             "holdout_rel_l2_vs_exact": float(rel_l2(pred_test, test_exact_y).mean()),
             "transfer": {
                 "gpu_basis_resident_fp16_bytes": int(output_rank * down.shape[0] * 2),
+                "gpu_output_mean_resident_fp16_bytes": int(down.shape[0] * 2),
+                "gpu_residual_artifact_resident_fp16_bytes": int((output_rank + 1) * down.shape[0] * 2),
                 "per_token_h2d_values_fp16_bytes": value_bytes,
                 "per_token_h2d_bitmask_bytes": mask_bytes if keep < output_rank else 0,
                 "per_token_h2d_indices_uint8_bytes": index_bytes if keep < output_rank else 0,

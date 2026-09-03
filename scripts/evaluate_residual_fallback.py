@@ -110,6 +110,7 @@ def main() -> None:
                 "approx_rel_l2_vs_capture_holdout": float(rel_l2(test_approx, test_capture_y).mean()),
                 "approx_rel_l2_vs_exact_holdout": float(rel_l2(test_approx, test_exact_y).mean()),
                 "transfer": {
+                    "gpu_output_mean_resident_fp16_bytes": int(down.shape[0] * 2),
                     "approx_path_h2d_base_plus_coeff_plus_bitmask_bytes": approx_bytes,
                     "fallback_path_h2d_full_down_weight_bytes_q4": down_bytes,
                     "expected_h2d_bytes_per_token": expected_h2d,

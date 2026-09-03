@@ -172,6 +172,7 @@ def main() -> None:
                     # CPU creates the base; GPU receives output_rank coefficients and
                     # applies a resident output basis. The basis itself is uploaded once.
                     basis_bytes = int(output_rank * down.shape[0] * 2)
+                    output_mean_bytes = int(down.shape[0] * 2)
                     coeff_bytes = int(output_rank * 2)
                     rows.append({
                         "degree": degree,
@@ -186,6 +187,8 @@ def main() -> None:
                         "hybrid_rel_l2_vs_exact_holdout": float(rel_l2(pred_test, test_exact_y).mean()),
                         "transfer": {
                             "gpu_basis_resident_fp16_bytes": basis_bytes,
+                            "gpu_output_mean_resident_fp16_bytes": output_mean_bytes,
+                            "gpu_residual_artifact_resident_fp16_bytes": basis_bytes + output_mean_bytes,
                             "per_token_h2d_residual_coeff_fp16_bytes": coeff_bytes,
                             "per_token_cpu_base_output_fp16_bytes": int(down.shape[0] * 2),
                             "full_down_weight_bytes_q4": down_bytes,
