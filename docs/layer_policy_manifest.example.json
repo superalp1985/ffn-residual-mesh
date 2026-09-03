@@ -1,0 +1,51 @@
+{
+  "policy_version": 1,
+  "model_family": "qwen35",
+  "quantization": "Q4_K_M",
+  "residual_target": "capture",
+  "default_mode": "exact",
+  "approximate_layers": {
+    "10": {
+      "base_basis": "chebyshev",
+      "base_degree": 4,
+      "chebyshev_bound_sigma": 5.0,
+      "input_rank": 128,
+      "output_rank": 64,
+      "default_keep": 4,
+      "tail_threshold_source": "calibration_q0.90",
+      "holdout_mixed_rel_l2_proxy": 0.03214,
+      "holdout_approx_fraction_proxy": 0.99275,
+      "approx_packet_bytes": 4112
+    },
+    "22": {
+      "base_basis": "chebyshev",
+      "base_degree": 4,
+      "chebyshev_bound_sigma": 6.0,
+      "input_rank": 128,
+      "output_rank": 64,
+      "default_keep": 4,
+      "tail_threshold_source": "calibration_q0.90",
+      "holdout_mixed_rel_l2_proxy": 0.04686,
+      "holdout_approx_fraction_proxy": 0.95652,
+      "approx_packet_bytes": 4112
+    },
+    "23": {
+      "base_basis": "chebyshev",
+      "base_degree": 5,
+      "chebyshev_bound_sigma": 5.0,
+      "input_rank": 128,
+      "output_rank": 64,
+      "default_keep": 4,
+      "tail_threshold_source": "calibration_q0.95",
+      "holdout_mixed_rel_l2_proxy": 0.02206,
+      "holdout_approx_fraction_proxy": 0.98551,
+      "approx_packet_bytes": 4112
+    }
+  },
+  "exact_layers_until_calibrated": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21],
+  "notes": [
+    "Metrics are offline holdout proxies, not end-to-end llama.cpp measurements.",
+    "Fallback retains the exact FFN path; threshold and packet size are layer-specific.",
+    "Approximate base output is 2048-dim fp16 and is expected to move through a pinned ring buffer."
+  ]
+}
