@@ -173,3 +173,33 @@ gate/up 块要经过 SwiGLU 门控传播，down 块直接在 hidden 输出空间
 - 每层只需保存每个中间神经元的均值、尺度和少量多项式系数；degree=4 时约 86 KiB(fp16) 的系数产物。
 
 这证明“非线性可以拆成预展开系数 + 运行时乘加”，但还没有证明权重搬运一定下降：gate/up/down 的矩阵乘仍需权重。下一步必须把该公式与分块权重拆分结合，单独测动态 H2D 字节和块复用率。
+
+## 2026-09-03 残差系数目标与稀疏路由
+
+按神经元多项式基础项接入低秩输出残差后，残差拟合目标需要区分两种语义：
+
+```text
+r_exact = W_down @ h_exact - y_base
+r_capture = y_captured - y_base
+```
+
+`r_exact` 更接近数学重放，`r_capture` 更接近量化模型实际输出。layer 23 上，degree=4、输入秩 128、输出秩 64 时，拟合 `r_capture` 的留出误差约 0.0267，优于拟合 `r_exact` 的约 0.0275；layer 22 仍约 0.0766，说明目标函数不能替代分层适配。
+
+残差系数可以继续做 CPU top-k：
+
+```text
+I_k = TopK(|alpha(x)|)
+y_hat = y_base + mu_r + sum_{i in I_k} alpha_i U_i
+```
+
+layer 23 的 `output_rank=64` 上，top-k=4（16 B fp16 值 + 8 B bitmask）与完整系数误差接近，证明“系数稀疏化”比单纯提高输出秩更划算。实际部署必须计入 bitmask/索引和 GPU gather 成本。
+
+由于 SVD 输出基底正交，省略系数的二范数可以作为第一版路由信号：
+
+```text
+tail(x) = ||alpha(x) - TopK(alpha(x))||_2
+```
+
+用校准分位数设置阈值后，layer 23 可在约 97--99% token 走近似路径时保持约 2.66--2.68% 的留出误差代理，并把期望 down 权重搬运降到约 0.08--0.23 MiB/token。layer 22 即使全近似也约 7.7%，必须回退。
+
+以上 H2D 数字是流量代理，不代表 llama.cpp 已实现；下一阶段必须用连续 token、超级块和 pinned ring buffer 测真实 DMA、同步和 kernel 时间。
