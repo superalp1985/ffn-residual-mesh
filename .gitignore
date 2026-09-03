@@ -9,6 +9,8 @@ data/outputs/**
 *.bin
 *.dll
 *.exe
+*.exp
+*.lib
 *.pt
 *.pth
 
