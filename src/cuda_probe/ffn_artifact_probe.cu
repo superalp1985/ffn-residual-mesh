@@ -192,6 +192,51 @@ __global__ void merge_packed_kernel(
     output[flat] = value;
 }
 
+__global__ void merge_packed_half2_kernel(
+        const std::uint8_t * packet,
+        const __half * basis,
+        const __half * mean,
+        float * output,
+        int tokens,
+        int hidden,
+        int rank,
+        int keep,
+        std::size_t base_bytes,
+        std::size_t coeff_bytes) {
+    const int pairs_per_token = hidden / 2;
+    const int pair_flat = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total_pairs = tokens * pairs_per_token;
+    if (pair_flat >= total_pairs) {
+        return;
+    }
+    const auto * base = reinterpret_cast<const __half *>(packet);
+    const auto * coeff = reinterpret_cast<const __half *>(packet + base_bytes);
+    const auto * indices = reinterpret_cast<const std::uint16_t *>(packet + base_bytes + coeff_bytes);
+    const int token = pair_flat / pairs_per_token;
+    const int pair_in_token = pair_flat - token * pairs_per_token;
+    const int feature = pair_in_token * 2;
+    const auto base_pair = reinterpret_cast<const __half2 *>(base)[pair_flat];
+    const auto mean_pair = reinterpret_cast<const __half2 *>(mean)[feature / 2];
+    float2 value = __half22float2(base_pair);
+    const float2 mean_value = __half22float2(mean_pair);
+    value.x += mean_value.x;
+    value.y += mean_value.y;
+    for (int slot = 0; slot < keep; ++slot) {
+        const int route = indices[token * keep + slot];
+        if (route < rank) {
+            const float scale = __half2float(coeff[token * keep + slot]);
+            const auto basis_pair = reinterpret_cast<const __half2 *>(
+                basis + static_cast<std::size_t>(route) * hidden + feature)[0];
+            const float2 basis_value = __half22float2(basis_pair);
+            value.x += scale * basis_value.x;
+            value.y += scale * basis_value.y;
+        }
+    }
+    const int output_index = token * hidden + feature;
+    output[output_index] = value.x;
+    output[output_index + 1] = value.y;
+}
+
 Benchmark benchmark_packed(
         const Artifact & artifact,
         int tokens,
@@ -199,7 +244,8 @@ Benchmark benchmark_packed(
         __half * device_mean,
         int iterations,
         int warmup,
-        std::vector<float> * validation_output = nullptr) {
+        std::vector<float> * validation_output = nullptr,
+        bool vectorized = false) {
     const auto & h = artifact.header;
     const std::size_t base_count = static_cast<std::size_t>(tokens) * h.hidden;
     const std::size_t coeff_count = static_cast<std::size_t>(tokens) * h.keep;
@@ -227,12 +273,20 @@ Benchmark benchmark_packed(
     CUDA_CHECK(cudaEventCreate(&copy_stop));
     CUDA_CHECK(cudaEventCreate(&stop));
 
-    const int blocks = (tokens * static_cast<int>(h.hidden) + 255) / 256;
+    const int work_items = vectorized
+        ? tokens * (static_cast<int>(h.hidden) / 2)
+        : tokens * static_cast<int>(h.hidden);
+    const int blocks = (work_items + 255) / 256;
     auto enqueue = [&]() {
         CUDA_CHECK(cudaMemcpyAsync(device_packet, host_packet, payload_bytes, cudaMemcpyHostToDevice, stream));
         CUDA_CHECK(cudaEventRecord(copy_stop, stream));
-        merge_packed_kernel<<<blocks, 256, 0, stream>>>(device_packet, device_basis, device_mean,
-            device_output, tokens, h.hidden, h.rank, h.keep, base_bytes, coeff_bytes);
+        if (vectorized) {
+            merge_packed_half2_kernel<<<blocks, 256, 0, stream>>>(device_packet, device_basis, device_mean,
+                device_output, tokens, h.hidden, h.rank, h.keep, base_bytes, coeff_bytes);
+        } else {
+            merge_packed_kernel<<<blocks, 256, 0, stream>>>(device_packet, device_basis, device_mean,
+                device_output, tokens, h.hidden, h.rank, h.keep, base_bytes, coeff_bytes);
+        }
         CUDA_CHECK(cudaGetLastError());
     };
     for (int i = 0; i < warmup; ++i) {
@@ -400,16 +454,24 @@ int main(int argc, char ** argv) {
         const std::vector<int> requested = {1, 16, 64};
         std::vector<Benchmark> benchmarks;
         std::vector<Benchmark> packed_benchmarks;
+        std::vector<Benchmark> packed_half2_benchmarks;
         std::vector<float> packed_output_64;
+        std::vector<float> packed_half2_output_64;
+        if ((h.hidden % 2) != 0) {
+            throw std::runtime_error("half2 benchmark requires an even hidden size");
+        }
         for (int tokens : requested) {
             if (tokens <= static_cast<int>(h.tokens)) {
                 benchmarks.push_back(benchmark(artifact, tokens, device_basis, device_mean, 200, 20));
                 packed_benchmarks.push_back(benchmark_packed(artifact, tokens, device_basis, device_mean, 200, 20,
                     tokens == 64 ? &packed_output_64 : nullptr));
+                packed_half2_benchmarks.push_back(benchmark_packed(artifact, tokens, device_basis, device_mean, 200, 20,
+                    tokens == 64 ? &packed_half2_output_64 : nullptr, true));
             }
         }
         std::vector<float> reference_64(artifact.reference.begin(), artifact.reference.begin() + packed_output_64.size());
         const Metrics packed_implementation = compare(packed_output_64, reference_64, 64, h.hidden);
+        const Metrics packed_half2_implementation = compare(packed_half2_output_64, reference_64, 64, h.hidden);
 
         CUDA_CHECK(cudaFree(device_basis));
         CUDA_CHECK(cudaFree(device_mean));
@@ -440,6 +502,10 @@ int main(int argc, char ** argv) {
              << ", \"p95_rel_l2\": " << packed_implementation.p95_rel_l2
              << ", \"max_abs_error\": " << packed_implementation.max_abs
              << ", \"mean_abs_error\": " << packed_implementation.mean_abs << "},\n";
+        json << "  \"packed_half2_implementation_vs_fp16_reference\": {\"mean_rel_l2\": " << packed_half2_implementation.mean_rel_l2
+             << ", \"p95_rel_l2\": " << packed_half2_implementation.p95_rel_l2
+             << ", \"max_abs_error\": " << packed_half2_implementation.max_abs
+             << ", \"mean_abs_error\": " << packed_half2_implementation.mean_abs << "},\n";
         json << "  \"approximation_vs_capture\": {\"mean_rel_l2\": " << approximation.mean_rel_l2
              << ", \"p95_rel_l2\": " << approximation.p95_rel_l2
              << ", \"max_abs_error\": " << approximation.max_abs
@@ -469,6 +535,20 @@ int main(int argc, char ** argv) {
                  << ", \"pipeline_ms\": " << row.pipeline_ms
                  << ", \"pipeline_ms_per_token\": " << row.pipeline_ms / row.tokens << "}";
             if (i + 1 != packed_benchmarks.size()) json << ',';
+            json << '\n';
+        }
+        json << "  ],\n";
+        json << "  \"packed_half2_benchmarks\": [\n";
+        for (std::size_t i = 0; i < packed_half2_benchmarks.size(); ++i) {
+            const auto & row = packed_half2_benchmarks[i];
+            json << "    {\"tokens\": " << row.tokens
+                 << ", \"payload_bytes\": " << row.payload_bytes
+                 << ", \"payload_bytes_per_token\": " << row.payload_bytes / row.tokens
+                 << ", \"h2d_ms\": " << row.h2d_ms
+                 << ", \"kernel_ms\": " << row.kernel_ms
+                 << ", \"pipeline_ms\": " << row.pipeline_ms
+                 << ", \"pipeline_ms_per_token\": " << row.pipeline_ms / row.tokens << "}";
+            if (i + 1 != packed_half2_benchmarks.size()) json << ',';
             json << '\n';
         }
         json << "  ]\n";

@@ -16,6 +16,8 @@ The executable accepts one optional argument: the JSON output path. The default 
 
 The artifact probe reports two transport layouts: `benchmarks` uses three separate H2D copies for base, coefficients, and indices; `packed_benchmarks` first combines them into one contiguous pinned packet and uses one H2D copy. Both layouts run the same merge formula, and the packed path has an independent 64-token numerical check.
 
+`packed_half2_benchmarks` is a negative-control optimization: it uses `__half2` to process two hidden values per thread. It is retained for comparison, but on the current layer-23 shape it does not materially improve end-to-end latency.
+
 The prototype uses CUDA pinned host allocation, non-blocking streams, asynchronous H2D copies, resident GPU basis vectors and residual mean, and CUDA events. Its exact fallback paths are transfer stress proxies, not complete exact FFN implementations.
 
 Example build from PowerShell:
