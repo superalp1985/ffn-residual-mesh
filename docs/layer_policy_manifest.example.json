@@ -2,8 +2,28 @@
   "policy_version": 1,
   "model_family": "qwen35",
   "quantization": "Q4_K_M",
-  "residual_target": "capture",
+  "residual_target": "persistent_vram_first",
   "default_mode": "exact",
+  "residency": {
+    "policy": "persistent_set_plus_swap",
+    "persistent_layers": [],
+    "window_layers": 1,
+    "prefetch_depth": 1,
+    "double_buffer": true,
+    "keep_residuals_in_vram": true,
+    "main_coefficients_location": "system_ram",
+    "attention_kv_workspace_reserve_bytes": 0,
+    "allocator_headroom_bytes": 0,
+    "resident_hit_weight_h2d_bytes": 0,
+    "unknown_layers": "exact_fallback",
+    "measurement_required": [
+      "resident_hit_weight_h2d_bytes",
+      "residual_miss_bytes",
+      "exposed_prefetch_wait_ms",
+      "inflight_eviction_rejections",
+      "gpu_kernel_span_ms"
+    ]
+  },
   "approximate_layers": {
     "10": {
       "base_basis": "chebyshev",
@@ -46,6 +66,8 @@
   "notes": [
     "Metrics are offline holdout proxies, not end-to-end llama.cpp measurements.",
     "Fallback retains the exact FFN path; threshold and packet size are layer-specific.",
-    "Approximate base output is 2048-dim fp16 and is expected to move through a pinned ring buffer."
+    "Approximate base output is 2048-dim fp16 and is expected to move through a pinned ring buffer.",
+    "Persistent residual packages are preferred; a window is a swap unit, not a reason to evict persistent layers.",
+    "This policy describes scheduling intent. It is not evidence of end-to-end overlap or GPU saturation."
   ]
 }
