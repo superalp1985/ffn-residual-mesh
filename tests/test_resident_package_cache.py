@@ -142,6 +142,68 @@ class ResidentPackageCacheTests(unittest.TestCase):
             self.assertIn(0, cache.device_layers())
             self.assertEqual(cache.traffic["weight_h2d_bytes"], 5 * 256)
 
+    def test_async_prefetch_can_overlap_before_acquire_and_hit_has_no_copy(self) -> None:
+        import torch
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA unavailable")
+        from resident_package_cache import ResidentPackageCache
+        from resident_window_scheduler import ResidentWindowScheduler
+
+        packages = {
+            0: {"value": np.arange(4096, dtype=np.float32)},
+            1: {"value": np.arange(4096, dtype=np.float32) + 1},
+        }
+        size = packages[0]["value"].nbytes
+        scheduler = ResidentWindowScheduler(1, size * 2, layer_bytes={0: size, 1: size})
+        with ResidentPackageCache(packages, scheduler=scheduler) as cache:
+            tickets = cache.prefetch_async([0, 1])
+            self.assertEqual(len(tickets), 2)
+            self.assertEqual(cache.pending_layers(), [0, 1])
+            cache.wait_prefetch(0)
+            first = cache.acquire(0)
+            self.assertEqual(first["weight_h2d_bytes"], 0)
+            cache.release(0)
+            cache.wait_prefetch(1)
+            second = cache.acquire(1)
+            self.assertEqual(second["weight_h2d_bytes"], 0)
+            cache.release(1)
+            self.assertEqual(cache.traffic["weight_h2d_bytes"], size * 2)
+
+    def test_async_prefetch_requires_wait_before_package_access(self) -> None:
+        import torch
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA unavailable")
+        from resident_package_cache import ResidentPackageCache
+        from resident_window_scheduler import ResidentWindowScheduler
+
+        payload = np.ones(1024, dtype=np.float32)
+        scheduler = ResidentWindowScheduler(1, payload.nbytes, layer_bytes={0: payload.nbytes})
+        with ResidentPackageCache({0: {"value": payload}}, scheduler=scheduler) as cache:
+            cache.prefetch_async([0])
+            with self.assertRaises(RuntimeError):
+                cache.package(0)
+            cache.wait_prefetch(0)
+            np.testing.assert_array_equal(cache.package(0)["value"].cpu(), payload)
+
+    def test_compute_stream_wait_event_is_recorded_for_async_ticket(self) -> None:
+        import torch
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA unavailable")
+        from resident_package_cache import ResidentPackageCache
+        from resident_window_scheduler import ResidentWindowScheduler
+
+        payload = np.arange(512, dtype=np.float32)
+        scheduler = ResidentWindowScheduler(1, payload.nbytes, layer_bytes={0: payload.nbytes})
+        compute = torch.cuda.Stream()
+        with ResidentPackageCache({0: {"value": payload}}, scheduler=scheduler) as cache:
+            cache.prefetch_async([0])
+            event = cache.wait_prefetch(0, stream=compute)
+            self.assertIsNotNone(event)
+            with torch.cuda.stream(compute):
+                result = cache.package(0)["value"] + 2
+            compute.synchronize()
+            np.testing.assert_array_equal(result.cpu(), payload + 2)
+
 
 if __name__ == "__main__":
     unittest.main()

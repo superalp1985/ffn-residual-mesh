@@ -134,19 +134,41 @@ class ResidentWindowScheduler:
         }
 
     def complete_prefetch(self, layer: int) -> dict[str, object]:
+        result = self.publish_prefetch(layer)
+        entry = self._layers[layer]
+        entry.copy_in_flight = False
+        size = int(result["weight_h2d_bytes"])
+        self.traffic["weight_h2d_bytes"] += size
+        self.traffic["residual_misses"] += 1
+        return result
+
+    def publish_prefetch(self, layer: int) -> dict[str, object]:
         self._require_known({layer})
         if layer not in self._pending:
             if self._layers[layer].resident:
                 return {"layer": layer, "resident_hit": True, "weight_h2d_bytes": 0}
             raise ResidencyError(f"layer {layer} is not pending")
-        if self._layers[layer].copy_in_flight:
-            self._layers[layer].copy_in_flight = False
         self._pending.remove(layer)
         self._layers[layer].resident = True
         size = self._layers[layer].bytes
+        return {"layer": layer, "resident_hit": False, "weight_h2d_bytes": size}
+
+    def finish_prefetch(self, layer: int, transfer: dict[str, object] | None = None) -> dict[str, object]:
+        self._require_known({layer})
+        entry = self._layers[layer]
+        if not entry.copy_in_flight:
+            raise ResidencyError(f"layer {layer} has no in-flight copy")
+        entry.copy_in_flight = False
+        if transfer is None:
+            transfer = {
+                "layer": layer,
+                "resident_hit": False,
+                "weight_h2d_bytes": entry.bytes,
+            }
+        size = int(transfer["weight_h2d_bytes"])
         self.traffic["weight_h2d_bytes"] += size
         self.traffic["residual_misses"] += 1
-        return {"layer": layer, "resident_hit": False, "weight_h2d_bytes": size}
+        return transfer
 
     def begin_prefetch(self, layer: int) -> None:
         self._require_known({layer})
