@@ -227,6 +227,8 @@ SwiGLU/down：GPU 计算
 
 旧手机、平板、迷你主机和 NAS 可以作为分布式 base worker。它们贡献的是内存容量、串行/向量计算和并行设备数量；中心 GPU 仍负责最适合 GPU 的 residual 和非线性算子。
 
+完整 FFN offload 是另一条更直接的基线：设备保存一整层 `gate/up/down`，本地完成 `gate -> SiLU -> up -> down`，中心端只接收输出 hidden。它不使用 base/residual 拆分，但可以先验证“传激活而不是传权重”的工程收益。对 batch=1 文本 decode，hidden 边界通常很小；对长视频，边界随 token 行数线性放大，必须单独测量。
+
 ## 9. 精确与近似的边界
 
 精确路径：

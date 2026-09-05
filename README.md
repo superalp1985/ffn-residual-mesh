@@ -50,6 +50,7 @@ The model weights are not re-sent as a dense layer on every step. The link carri
 - A cold-start compiler model: scan the original weights once, build finite formulas/partial sums/residual artifacts, then avoid rescanning dense weight streams during normal execution.
 - A practical path toward **Windows + NVIDIA CUDA 13 + ComfyUI + TeaCache + wired tablet workers**.
 - A phone/tablet worker protocol with row sharding, checksums, deadlines, concurrent dispatch, and exact GPU fallback.
+- A complete-FFN worker baseline: the device owns a full FFN layer and returns only the post-down hidden result.
 
 The point is not to pretend that a phone replaces a GPU. The point is to make idle GPU arithmetic useful while the host and device stop fighting over the same bandwidth bottleneck.
 
@@ -158,6 +159,10 @@ ComfyUI model wrapper
 
 The first hardware milestone is a Windows host with an RTX 4070-class GPU and one or more USB/10GbE-connected tablets. Phones come after the wired tablet path is measured. Any worker deadline miss falls back to exact center-GPU execution.
 
+### Complete FFN Offload Baseline
+
+The repository now includes a separate baseline in which a worker stores a complete FFN layer, computes `gate -> SiLU -> up -> down` locally, and returns only the hidden output. For Qwen3.5 2B batch-1 decode this is about 8 KiB of fp16 activation roundtrip per layer, far smaller than repeatedly moving the layer weights. The tradeoff is different from residual split: layer dependencies make the 24 round trips serial, so worker compute and per-layer latency matter more than link bandwidth. For long packed video sequences such as MiniMax H3, the activation boundary is much larger and must be measured separately.
+
 ## Repository Map
 
 - `docs/math_principles_report.md`: full mathematical report and Qwen3.8-27B-class budget.
@@ -168,8 +173,10 @@ The first hardware milestone is a Windows host with an RTX 4070-class GPU and on
 - `scripts/simulate_comfyui_phone_ffn.py`: H3/ComfyUI phone-link simulation.
 - `scripts/simulate_phone_ffn_cluster.py`: distributed FFN base-worker budget model.
 - `src/phone_ffn_loopback.py`: framed worker protocol, checksum, concurrency, deadline, fallback.
+- `src/full_ffn_loopback.py`: complete FFN layer worker and direct numerical equivalence check.
 - `tests/`: correctness and protocol tests.
 - `docs/log/`: iteration records with assumptions and results.
+- `scripts/simulate_full_ffn_phone_offload.py`: complete-FFN activation-boundary and layer-dependency budget model.
 
 ## Honest Boundary
 
