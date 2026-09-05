@@ -33,15 +33,21 @@
 - `docs/experiment_outline.md`：实验总纲和验收门槛。
 - `docs/research_notes.md`：调研结论、公式和工程约束。
 - `docs/math_principles_report.md`：公开数学原理、运行时边界和 Qwen3.8-27B 适配报告。
+- `docs/comfyui_phone_cluster_design.md`：MiniMax H3/ComfyUI 手机或平板 FFN worker 后端设计与模拟结论。
 - `docs/release_checklist.md`：GitHub release candidate 检查项与发布边界。
 - `docs/asset_manifest.md`：模型、运行库和环境来源。
 - `docs/log/`：按日期记录每轮实验。
 - `scripts/`：可重复运行的探针和基线脚本。
 - `src/`：实验代码。
+- `src/phone_ffn_loopback.py`：手机/平板 FFN worker 的协议级 loopback，覆盖分片、校验、并发和 deadline fallback。
 
 本轮新增：`scripts/estimate_27b_ffn_budget.py` 用于 27B-class FFN 的显存、H2D 和计算密度账本；`scripts/build_and_run_full_ffn_cuda.py` 与 `src/exact_cpu_base_gpu_full_ffn_runner.cu` 用于 C++ CPU 主项 + GPU residual/SwiGLU/down 双缓冲验证。预算结果只代表单层/FFN 子图，不代表完整 27B 端到端吞吐。
 
 另有 `scripts/simulate_phone_ffn_cluster.py`，用于模拟旧手机组成分布式 FFN 主项计算池。当前默认模型为输出行分片：手机保存编译表分片并并行生成 gate/up base，中心 GPU 保持 residual、合并、SwiGLU 和 down。该模拟只用于网络、L3 工作集和临界路径预算，不代表真实 Android 性能。
+
+MiniMax H3/ComfyUI 的视频场景使用 `scripts/simulate_comfyui_phone_ffn.py`。该脚本显式区分精确 gate/up 回传与 hidden 近似回传，并把 TeaCache 的 real/reuse step 计入网络和 residual 账本。
+
+`src/phone_ffn_loopback.py` 目前只验证调度协议，不代表真实 Android 性能；它把 worker 超时和校验失败都导向中心 GPU 的精确 fallback。
 
 ## Qwen3.8-27B 状态
 
