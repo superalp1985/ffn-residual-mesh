@@ -10,6 +10,26 @@ Its core idea is simple but deliberately aggressive:
 
 This is not a FLOPs-reduction trick. It is a **compute-for-bandwidth exchange**: the GPU does more regular arithmetic so it does not sit idle waiting for large weight streams over PCIe or device memory bandwidth.
 
+## The Hardware Problem
+
+Modern GPUs often have enormous peak throughput, but an FFN can still run at low **effective compute density**. The matrix units are ready to work; the workload is waiting for weight bytes, cache misses, PCIe transfers, synchronization, or a larger VRAM window. In this regime, the practical bottleneck is not theoretical FLOPs. It is the combination of:
+
+- GPU arithmetic units not being continuously fed;
+- limited VRAM capacity for large dense weights;
+- limited H2D/device-memory bandwidth;
+- host and device repeatedly moving bulky, highly repetitive FFN data.
+
+FFN Residual Mesh makes this an explicit resource exchange:
+
+| We spend | We get back |
+|---|---|
+| cold-start scan and compilation time | pre-expanded base artifacts in host/worker memory |
+| CPU, tablet, or phone serial/vector arithmetic | less bulky FFN weight traffic to the GPU |
+| additional regular GPU residual arithmetic | higher useful work per transferred byte |
+| RAM and worker storage | freedom from keeping every FFN base term resident in VRAM |
+
+The algorithm does not claim to create free compute. It moves work to the place where that work is cheaper: regular residual arithmetic stays on CUDA, while repetitive FFN base information is expanded ahead of time and kept outside the most expensive bandwidth path.
+
 ## What We Claim
 
 - A layered FFN split/merge algorithm that can be exact in the selected integer/quantized domain.
