@@ -1,0 +1,122 @@
+from __future__ import annotations
+
+import importlib.util
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+import numpy as np
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT / "scripts"))
+
+
+@unittest.skipUnless(importlib.util.find_spec("torch") and importlib.util.find_spec("triton"),
+                     "tiled FFN test requires the cu130 venv")
+class TiledResidentFfnTests(unittest.TestCase):
+    def test_tiled_gate_up_swiglu_matches_artifact_reference(self) -> None:
+        import torch
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA unavailable")
+        from tests.gguf_fixture import write_fixture
+        from compile_resident_residual_artifact import compile_layer
+        from resident_residual_format import ResidentArtifact
+        from resident_tiled_ffn import TiledResidentGateUp
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_fixture(root / "fixture.gguf")
+            compile_layer(root / "fixture.gguf", 0, 4, root / "artifact")
+            with ResidentArtifact.open(root / "artifact") as artifact:
+                runner = TiledResidentGateUp(artifact, tile_rows=64)
+                x = np.random.default_rng(560).standard_normal(runner.cols).astype(np.float32)
+                result = runner.run(x)
+                gate = artifact.reconstruct_weights("gate").astype(np.float64) @ x
+                up = artifact.reconstruct_weights("up").astype(np.float64) @ x
+                swiglu = gate / (1 + np.exp(-gate)) * up
+                np.testing.assert_allclose(result["gate"], gate, rtol=1e-4, atol=1e-4)
+                np.testing.assert_allclose(result["up"], up, rtol=1e-4, atol=1e-4)
+                np.testing.assert_allclose(result["swiglu"], swiglu, rtol=2e-4, atol=2e-4)
+                self.assertEqual(result["weight_h2d_bytes"], runner.cache.traffic["weight_h2d_bytes"])
+                self.assertEqual(result["resident_weight_h2d_bytes"], 0)
+
+    def test_tiled_runner_reports_cpu_base_and_tile_traffic_separately(self) -> None:
+        import torch
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA unavailable")
+        from tests.gguf_fixture import write_fixture
+        from compile_resident_residual_artifact import compile_layer
+        from resident_residual_format import ResidentArtifact
+        from resident_tiled_ffn import TiledResidentGateUp
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_fixture(root / "fixture.gguf")
+            compile_layer(root / "fixture.gguf", 0, 4, root / "artifact")
+            with ResidentArtifact.open(root / "artifact") as artifact:
+                runner = TiledResidentGateUp(artifact, tile_rows=64)
+                result = runner.run(np.zeros(runner.cols, dtype=np.float32))
+                self.assertIn("cpu_base_ms", result)
+                self.assertIn("tile_kernel_ms", result)
+                self.assertEqual(result["resident_weight_h2d_bytes"], 0)
+                self.assertGreater(result["weight_h2d_bytes"], 0)
+
+    def test_persistent_tiles_have_zero_weight_h2d_after_cold_start(self) -> None:
+        import torch
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA unavailable")
+        from tests.gguf_fixture import write_fixture
+        from compile_resident_residual_artifact import compile_layer
+        from resident_residual_format import ResidentArtifact
+        from resident_tiled_ffn import TiledResidentGateUp
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_fixture(root / "fixture.gguf")
+            compile_layer(root / "fixture.gguf", 0, 4, root / "artifact")
+            with ResidentArtifact.open(root / "artifact") as artifact:
+                runner = TiledResidentGateUp(artifact, tile_rows=64, persistent=True)
+                x = np.random.default_rng(562).standard_normal(runner.cols).astype(np.float32)
+                cold = runner.run(x)
+                before = runner.cache.traffic["weight_h2d_bytes"]
+                warm = runner.run(x)
+                self.assertGreater(cold["weight_h2d_bytes"], 0)
+                self.assertEqual(warm["weight_h2d_bytes"], before)
+                self.assertEqual(
+                    runner.cache.traffic["weight_h2d_bytes"],
+                    before,
+                )
+
+    def test_tiled_runner_can_feed_original_down_projection(self) -> None:
+        import torch
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA unavailable")
+        from tests.gguf_fixture import write_fixture
+        from compile_resident_residual_artifact import compile_layer
+        from resident_residual_cuda import DirectIQ4NLProjection
+        from resident_residual_format import ResidentArtifact
+        from resident_tiled_ffn import TiledResidentGateUp
+        from gguf import GGUFReader
+        from gguf.quants import dequantize
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_fixture(root / "fixture.gguf", quantized_down=True)
+            compile_layer(root / "fixture.gguf", 0, 4, root / "artifact")
+            with ResidentArtifact.open(root / "artifact") as artifact:
+                reader = GGUFReader(root / "fixture.gguf")
+                tensor = next(item for item in reader.tensors if item.name == "blk.0.ffn_down.weight")
+                down = DirectIQ4NLProjection(tensor.data, int(tensor.shape[0]))
+                x = np.random.default_rng(564).standard_normal(256).astype(np.float32)
+                with TiledResidentGateUp(artifact, tile_rows=64, persistent=True) as runner:
+                    result = runner.run(x, down=down)
+                    expected = dequantize(tensor.data, tensor.tensor_type).astype(np.float64) @ result["swiglu"]
+                    np.testing.assert_allclose(result["down"], expected, rtol=2e-4, atol=2e-4)
+                    self.assertIn("down_stream_ms", result)
+                reader.data._mmap.close()
+
+
+if __name__ == "__main__":
+    unittest.main()
