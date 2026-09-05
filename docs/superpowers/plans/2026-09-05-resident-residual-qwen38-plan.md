@@ -4,7 +4,7 @@
 
 **Goal:** Replace runtime radix-table compilation and residual-weight H2D transfers with offline static FFN decomposition and GPU-resident 4-bit residual weights for a Qwen3.8-27B-class model.
 
-**Architecture:** The cold-start compiler reads the quantized GGUF once and writes a memory-mappable artifact containing static base coefficients, residual codes, scales, layer metadata, and exact fallback data. Runtime keeps the full base artifact in system RAM, keeps the current residual layer/window in VRAM, computes dynamic residual dots on CUDA, merges gate/up before SwiGLU, and pages only residual windows when all-layer residency does not fit.
+**Architecture:** The cold-start compiler reads the quantized GGUF once and writes a memory-mappable artifact containing static base coefficients, residual codes, scales, layer metadata, and exact fallback data. Runtime keeps base coefficients in system RAM and prioritizes a persistent residual working set in VRAM. A small, separately budgeted swap area serves residual packages that do not fit persistently. Resident packages must survive layer/window transitions. CUDA computes residual dots and merges gate/up before SwiGLU. Unsupported original-format paths remain explicitly labeled fallbacks, not residual traffic.
 
 **Tech Stack:** Python 3.12, NumPy, gguf-py, C++17, AVX2, CUDA 13 / PyTorch 2.9.1+cu130, Triton, existing llama.cpp GGUF loader.
 
@@ -38,6 +38,34 @@ See `docs/log/2026-09-05-iteration-52.md` for measured scope and limitations.
 - GPU residency, H2D bytes, GPU wait, and layer critical path are primary metrics; FLOPs alone are insufficient.
 - The first target is one Qwen3.8-27B layer, then a 4-layer window; no full-model claim before measured end-to-end evidence.
 - Keep the original quantized GGUF as exact fallback; never delete or rewrite user downloads.
+
+## User Priority Clarification (2026-09-05)
+
+The target is useful GPU execution with less exposed waiting, not minimum
+VRAM occupancy. VRAM is the primary home for residual packages; system-memory
+offload supplements it only for packages that cannot remain resident.
+
+- Reserve attention/KV, workspace, allocator headroom and active/pending buffers
+  before assigning the persistent residual budget.
+- Keep the persistent set across decode sweeps. Do not cycle all FFN weights
+  merely because the whole model cannot fit.
+- Prefetch only absent residual packages, with their scales and required
+  metadata, into the swap area. A resident hit must schedule zero weight H2D.
+- Keep main coefficients on the CPU side; compute each input-dependent main
+  result there and submit that result before the merge deadline. Do not
+  describe cold-start pre-expansion as eliminating runtime coefficient reads.
+- Separate residual misses, activation/result traffic, and legacy fallback
+  weight traffic in the ledger. The 9.24 GiB mixed-format capacity estimate is
+  neither residual-package size nor mandatory per-token transfer volume.
+- Adapt residency and prefetch depth to measured memory headroom and deadlines.
+  Reassignment must respect in-flight kernels/copies and avoid repeated eviction
+  and reloading of the same packages.
+- Optimize end-to-end token latency at the same correctness target. Measure
+  exposed copy/CPU wait and kernel performance separately; do not add useless
+  arithmetic or infer useful throughput from a utilization percentage alone.
+
+This is the next implementation policy, not a claim that asynchronous paging
+or full GPU saturation has already been demonstrated.
 
 ---
 
@@ -195,6 +223,11 @@ git commit -m "Add GPU-resident residual projection kernel"
 
 ### Task 4: Implement layer/window residency scheduler
 
+**Revised policy:** A persistent residual set plus a small prefetched swap area
+is the primary design. One/four-layer rolling windows are comparison cases and
+swap-granularity choices, not a requirement to evict the persistent set.
+The current `plan_resident_memory.py` contains only capacity estimates.
+
 **Files:**
 - Create: `src/resident_window_scheduler.py`
 - Create: `scripts/simulate_resident_residual_windows.py`
@@ -225,7 +258,17 @@ Expected: FAIL because the scheduler does not exist.
 
 - [ ] **Step 3: Implement scheduler and budget accounting**
 
-Support one-layer and four-layer windows first. Track active residual bytes, down bytes, CUDA workspace, attention/KV reserve, and fallback state. Use double-buffered asynchronous uploads for the next window. Never evict a layer while its gate/up/down kernels are outstanding.
+Support persistent residency and one-layer/four-layer swap units first.
+Track persistent, active, pending and free bytes alongside down, CUDA workspace,
+attention/KV reserve and explicitly labeled fallback state. Double-buffer only
+nonresident packages. Never evict or overwrite storage while its copy or
+gate/up/down kernels are outstanding.
+
+Required additional tests: resident hits trigger no weight transfer; a miss
+copies only its package; active buffers cannot be evicted; KV growth cannot
+overcommit the combined budget; and a cyclic layer trace preserves persistent
+packages across token boundaries. Runtime benchmarks must report actual misses
+and exposed wait rather than assuming all transfers overlap compute.
 
 - [ ] **Step 4: Run test to verify it passes**
 
