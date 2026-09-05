@@ -242,6 +242,18 @@ class ResidentPackageCache:
             if ticket["published"] and event.query():
                 self.wait_prefetch(layer)
 
+    def try_finalize(self, layer: int) -> bool:
+        """Finalize a published async copy only when its CUDA event is ready."""
+        layer = int(layer)
+        ticket = self._async.get(layer)
+        if ticket is None:
+            return layer in self._device
+        event = ticket["end"]
+        if not ticket["published"] or not event.query():
+            return False
+        self.wait_prefetch(layer)
+        return True
+
     def lease(self, layer: int, *, stream: torch.cuda.Stream | None = None):
         cache = self
         layer = int(layer)
