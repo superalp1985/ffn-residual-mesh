@@ -15,6 +15,39 @@ The required properties are:
 3. Approximation, if enabled, is isolated to a declared residual representation or declared input-state remainder and has a computable local error bound.
 4. `g` and `u` are merged before the original SiLU and down projection. No invalid addition across SwiGLU is allowed.
 
+### 1.1 Resident artifact v1 boundary
+
+The first Qwen3.8-27B artifact implements only exact `Q4_K` gate/up
+projections. `IQ*`, `Q3_K`, `Q5_K`, and `Q6_K` tensors remain in the original
+GGUF as exact fallback until each decoder has its own independent round-trip
+test. This is a format boundary, not an approximation claim.
+
+The v1 decomposition uses one integer base per 32-code group:
+
+```text
+q[i] = c + r[i],  r[i] in [-8, 7]
+```
+
+The base is selected from the group min/max so the signed 4-bit residual
+never clips. The GPU-resident stream contains packed `r` plus `a`; the CPU
+host artifact contains the pre-expanded coefficient `a*c + beta`. `beta` and
+the original base descriptors are retained for verification and future
+repacking. No runtime lookup table is required.
+
+The byte ledger must report these separately:
+
+```text
+resident_weight_bytes          # one-time VRAM upload
+host_base_coefficient_bytes    # static system-memory artifact
+dynamic_h2d_bytes_per_token    # activation + base-result transfers
+residual_weight_h2d_bytes      # must be zero after residency
+fallback_bytes                 # original-format exact fallback
+```
+
+For a measured layer, a lower dynamic byte count is not by itself a speed
+claim. Kernel span, exposed CPU submission gap, CPU base time, and a separate
+raw-Q4 weight-stream baseline are required.
+
 ## 2. Q4_K Group Equation
 
 For output row `j`, Q4_K group `g`, and element `i` in that 32-value group, the decoded weight is:

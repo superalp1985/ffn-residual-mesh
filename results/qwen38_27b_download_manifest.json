@@ -1,12 +1,22 @@
 {
   "model_id": "Qwen/Qwen3.8-27B",
-  "source_model_card": "https://huggingface.co/Qwen/Qwen3.8-27B",
-  "quantization": "Q4_K",
-  "quantization_scope": "Unsloth UD-Q4_K_M mixed Q4-family tensor manifest; do not assume every tensor is Q4_K",
+  "model_id_basis": "experiment target label; see metadata for file-reported identity",
+  "metadata": {
+    "architecture": "qwen35",
+    "name": "Qwen3.8-27B",
+    "gguf_total_blocks": 65,
+    "mtp_layers": 1
+  },
+  "quantization": "UD-Q4_K_M (mixed)",
+  "quantization_scope": "filename preset only; each tensor retains its actual type",
   "file": {
     "path": "E:\\Qwen3.8-27B\\Qwen3.8-27B-UD-Q4_K_M.gguf",
     "bytes": 16464440224,
     "sha256": "322e194ff79741c7baa497c240f677f54b201b0efab44ca8e50f122b39123482"
+  },
+  "integrity": {
+    "status": "local_digest_only",
+    "expected_source_sha256": null
   },
   "dimensions": {
     "hidden": 5120,
@@ -2520,5 +2530,16 @@
     "Q5_K": 50,
     "Q6_K": 2
   },
-  "runtime_requires_table_lookup": false
+  "compilable_gate_up_layers": [
+    3,
+    21,
+    40,
+    42,
+    51
+  ],
+  "extra_ffn_tensors": [
+    "blk.64.ffn_down.weight",
+    "blk.64.ffn_gate.weight",
+    "blk.64.ffn_up.weight"
+  ]
 }

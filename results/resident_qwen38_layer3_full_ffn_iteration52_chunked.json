@@ -1,0 +1,106 @@
+{
+  "status": "measured_single_layer_full_ffn",
+  "layer": 3,
+  "dimensions": {
+    "hidden": 5120,
+    "ffn": 17408
+  },
+  "merge_order": "gate_up_before_swiglu",
+  "cpu_base_ms": 0.9535999270156026,
+  "resident_residual_kernel_ms": 3.157344102859497,
+  "swiglu_down_ms": 3.464128077030182,
+  "critical_ms": 6.832899991422892,
+  "dynamic_h2d_bytes": 159744,
+  "resident_payload_bytes": 161546304,
+  "cuda_peak_allocated_bytes": 162374144,
+  "cuda_peak_reserved_bytes": 169869312,
+  "vram_note": "allocator process peak; reserved is not whole-device usage",
+  "residual_weight_h2d_bytes_per_token": 0,
+  "timing": {
+    "wall_ms": 6.832899991422892,
+    "cpu_base_ms": 0.9535999270156026,
+    "activation_h2d_ms": 0.03407999873161316,
+    "residual_stream_span_ms": 3.157344102859497,
+    "exposed_cpu_submission_gap_ms": 0.002047999994829297,
+    "base_h2d_ms": 0.047968000173568726,
+    "merge_stream_span_ms": 0.5457280278205872,
+    "down_stream_span_ms": 2.9184000492095947,
+    "stream_span_ms": 6.447103977203369
+  },
+  "samples": [
+    {
+      "wall_ms": 7.03899993095547,
+      "cpu_base_ms": 0.9535999270156026,
+      "activation_h2d_ms": 0.03340800106525421,
+      "residual_stream_span_ms": 2.872704029083252,
+      "exposed_cpu_submission_gap_ms": 0.002047999994829297,
+      "base_h2d_ms": 0.05190400034189224,
+      "merge_stream_span_ms": 0.8082559704780579,
+      "down_stream_span_ms": 2.678783893585205,
+      "stream_span_ms": 6.447103977203369
+    },
+    {
+      "wall_ms": 6.832899991422892,
+      "cpu_base_ms": 1.1256999569013715,
+      "activation_h2d_ms": 0.03465599939227104,
+      "residual_stream_span_ms": 3.2134718894958496,
+      "exposed_cpu_submission_gap_ms": 0.002047999994829297,
+      "base_h2d_ms": 0.10259199887514114,
+      "merge_stream_span_ms": 0.4810880124568939,
+      "down_stream_span_ms": 2.9184000492095947,
+      "stream_span_ms": 6.752255916595459
+    },
+    {
+      "wall_ms": 5.8862000005319715,
+      "cpu_base_ms": 0.8678999729454517,
+      "activation_h2d_ms": 0.03407999873161316,
+      "residual_stream_span_ms": 1.4916800260543823,
+      "exposed_cpu_submission_gap_ms": 0.002047999994829297,
+      "base_h2d_ms": 0.047968000173568726,
+      "merge_stream_span_ms": 0.7722560167312622,
+      "down_stream_span_ms": 2.9962239265441895,
+      "stream_span_ms": 5.3442559242248535
+    },
+    {
+      "wall_ms": 7.749099982902408,
+      "cpu_base_ms": 0.937500037252903,
+      "activation_h2d_ms": 0.08131200075149536,
+      "residual_stream_span_ms": 4.046432018280029,
+      "exposed_cpu_submission_gap_ms": 0.0010239999974146485,
+      "base_h2d_ms": 0.04281599819660187,
+      "merge_stream_span_ms": 0.026815999299287796,
+      "down_stream_span_ms": 3.462143898010254,
+      "stream_span_ms": 7.660543918609619
+    },
+    {
+      "wall_ms": 5.99910004530102,
+      "cpu_base_ms": 1.2344000861048698,
+      "activation_h2d_ms": 0.030368000268936157,
+      "residual_stream_span_ms": 3.157344102859497,
+      "exposed_cpu_submission_gap_ms": 0.002047999994829297,
+      "base_h2d_ms": 0.03488000109791756,
+      "merge_stream_span_ms": 0.5457280278205872,
+      "down_stream_span_ms": 2.144256114959717,
+      "stream_span_ms": 5.914624214172363
+    }
+  ],
+  "down_quant_type": "IQ4_NL",
+  "output_rel_l2": 2.085325826466029e-07,
+  "output_max_abs": 4.3327640153467684e-07,
+  "quality_scope": "synthetic_inputs_not_model_quality",
+  "cpu_threads": 8,
+  "torch": "2.9.1+cu130",
+  "cuda": "13.0",
+  "device": "NVIDIA GeForce RTX 4070 Laptop GPU",
+  "source_path": "E:\\Qwen3.8-27B\\Qwen3.8-27B-UD-Q4_K_M.gguf",
+  "artifact_path": "D:\\ffn-residual-lab\\data\\resident_qwen38_layer3_exact_v1",
+  "input_seed": 20260905,
+  "tokens_per_second": null,
+  "unmeasured": [
+    "attention",
+    "KV",
+    "window_paging",
+    "generation",
+    "real activation quality"
+  ]
+}

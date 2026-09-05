@@ -1,0 +1,202 @@
+[
+  {
+    "status": "capacity_estimate_not_runtime_measurement",
+    "kv_bytes": 268435456,
+    "linear_recurrent_state_bytes": 150994944,
+    "linear_convolution_state_bytes": 5898240,
+    "fixed_attention_workspace_os_reserve_bytes": 1073741824,
+    "context_tokens": 4096,
+    "batch": 1,
+    "kv_element_bytes": 2,
+    "vram_bytes": 8589934592,
+    "budget_for_ffn_bytes": 7090864128,
+    "raw_ffn_bytes": 9861980160,
+    "mixed_v1_ffn_payload_bytes": 9917685760,
+    "compiled_gate_up_layers": [
+      3,
+      21,
+      40,
+      42,
+      51
+    ],
+    "all_layers_resident": false,
+    "windows": [
+      {
+        "window_layers": 1,
+        "double_buffer_payload_bytes": 391331840,
+        "working_set_bytes": 1890402304,
+        "steady_weight_h2d_bytes_per_token_if_no_persistent_layers": 9917685760
+      },
+      {
+        "window_layers": 4,
+        "double_buffer_payload_bytes": 1494302720,
+        "working_set_bytes": 2993373184,
+        "steady_weight_h2d_bytes_per_token_if_no_persistent_layers": 9917685760
+      },
+      {
+        "window_layers": 8,
+        "double_buffer_payload_bytes": 2828451840,
+        "working_set_bytes": 4327522304,
+        "steady_weight_h2d_bytes_per_token_if_no_persistent_layers": 9917685760
+      }
+    ],
+    "tokens_per_second": null,
+    "limits": [
+      "Raw fallback sizes are capacity placeholders; their full runtime kernels are not implemented.",
+      "FP16 KV and FP32 recurrent/conv state assumptions require backend verification.",
+      "Fixed reserve is user-configurable and does not prove attention weights/workspace fit.",
+      "Layer windows reduce peak capacity, NOT bytes streamed per decode sweep.",
+      "Prefetch cannot be guaranteed to hide transfer latency; measure dependency critical paths."
+    ]
+  },
+  {
+    "status": "capacity_estimate_not_runtime_measurement",
+    "kv_bytes": 536870912,
+    "linear_recurrent_state_bytes": 150994944,
+    "linear_convolution_state_bytes": 5898240,
+    "fixed_attention_workspace_os_reserve_bytes": 1073741824,
+    "context_tokens": 8192,
+    "batch": 1,
+    "kv_element_bytes": 2,
+    "vram_bytes": 8589934592,
+    "budget_for_ffn_bytes": 6822428672,
+    "raw_ffn_bytes": 9861980160,
+    "mixed_v1_ffn_payload_bytes": 9917685760,
+    "compiled_gate_up_layers": [
+      3,
+      21,
+      40,
+      42,
+      51
+    ],
+    "all_layers_resident": false,
+    "windows": [
+      {
+        "window_layers": 1,
+        "double_buffer_payload_bytes": 391331840,
+        "working_set_bytes": 2158837760,
+        "steady_weight_h2d_bytes_per_token_if_no_persistent_layers": 9917685760
+      },
+      {
+        "window_layers": 4,
+        "double_buffer_payload_bytes": 1494302720,
+        "working_set_bytes": 3261808640,
+        "steady_weight_h2d_bytes_per_token_if_no_persistent_layers": 9917685760
+      },
+      {
+        "window_layers": 8,
+        "double_buffer_payload_bytes": 2828451840,
+        "working_set_bytes": 4595957760,
+        "steady_weight_h2d_bytes_per_token_if_no_persistent_layers": 9917685760
+      }
+    ],
+    "tokens_per_second": null,
+    "limits": [
+      "Raw fallback sizes are capacity placeholders; their full runtime kernels are not implemented.",
+      "FP16 KV and FP32 recurrent/conv state assumptions require backend verification.",
+      "Fixed reserve is user-configurable and does not prove attention weights/workspace fit.",
+      "Layer windows reduce peak capacity, NOT bytes streamed per decode sweep.",
+      "Prefetch cannot be guaranteed to hide transfer latency; measure dependency critical paths."
+    ]
+  },
+  {
+    "status": "capacity_estimate_not_runtime_measurement",
+    "kv_bytes": 1073741824,
+    "linear_recurrent_state_bytes": 150994944,
+    "linear_convolution_state_bytes": 5898240,
+    "fixed_attention_workspace_os_reserve_bytes": 1073741824,
+    "context_tokens": 16384,
+    "batch": 1,
+    "kv_element_bytes": 2,
+    "vram_bytes": 8589934592,
+    "budget_for_ffn_bytes": 6285557760,
+    "raw_ffn_bytes": 9861980160,
+    "mixed_v1_ffn_payload_bytes": 9917685760,
+    "compiled_gate_up_layers": [
+      3,
+      21,
+      40,
+      42,
+      51
+    ],
+    "all_layers_resident": false,
+    "windows": [
+      {
+        "window_layers": 1,
+        "double_buffer_payload_bytes": 391331840,
+        "working_set_bytes": 2695708672,
+        "steady_weight_h2d_bytes_per_token_if_no_persistent_layers": 9917685760
+      },
+      {
+        "window_layers": 4,
+        "double_buffer_payload_bytes": 1494302720,
+        "working_set_bytes": 3798679552,
+        "steady_weight_h2d_bytes_per_token_if_no_persistent_layers": 9917685760
+      },
+      {
+        "window_layers": 8,
+        "double_buffer_payload_bytes": 2828451840,
+        "working_set_bytes": 5132828672,
+        "steady_weight_h2d_bytes_per_token_if_no_persistent_layers": 9917685760
+      }
+    ],
+    "tokens_per_second": null,
+    "limits": [
+      "Raw fallback sizes are capacity placeholders; their full runtime kernels are not implemented.",
+      "FP16 KV and FP32 recurrent/conv state assumptions require backend verification.",
+      "Fixed reserve is user-configurable and does not prove attention weights/workspace fit.",
+      "Layer windows reduce peak capacity, NOT bytes streamed per decode sweep.",
+      "Prefetch cannot be guaranteed to hide transfer latency; measure dependency critical paths."
+    ]
+  },
+  {
+    "status": "capacity_estimate_not_runtime_measurement",
+    "kv_bytes": 2147483648,
+    "linear_recurrent_state_bytes": 150994944,
+    "linear_convolution_state_bytes": 5898240,
+    "fixed_attention_workspace_os_reserve_bytes": 1073741824,
+    "context_tokens": 32768,
+    "batch": 1,
+    "kv_element_bytes": 2,
+    "vram_bytes": 8589934592,
+    "budget_for_ffn_bytes": 5211815936,
+    "raw_ffn_bytes": 9861980160,
+    "mixed_v1_ffn_payload_bytes": 9917685760,
+    "compiled_gate_up_layers": [
+      3,
+      21,
+      40,
+      42,
+      51
+    ],
+    "all_layers_resident": false,
+    "windows": [
+      {
+        "window_layers": 1,
+        "double_buffer_payload_bytes": 391331840,
+        "working_set_bytes": 3769450496,
+        "steady_weight_h2d_bytes_per_token_if_no_persistent_layers": 9917685760
+      },
+      {
+        "window_layers": 4,
+        "double_buffer_payload_bytes": 1494302720,
+        "working_set_bytes": 4872421376,
+        "steady_weight_h2d_bytes_per_token_if_no_persistent_layers": 9917685760
+      },
+      {
+        "window_layers": 8,
+        "double_buffer_payload_bytes": 2828451840,
+        "working_set_bytes": 6206570496,
+        "steady_weight_h2d_bytes_per_token_if_no_persistent_layers": 9917685760
+      }
+    ],
+    "tokens_per_second": null,
+    "limits": [
+      "Raw fallback sizes are capacity placeholders; their full runtime kernels are not implemented.",
+      "FP16 KV and FP32 recurrent/conv state assumptions require backend verification.",
+      "Fixed reserve is user-configurable and does not prove attention weights/workspace fit.",
+      "Layer windows reduce peak capacity, NOT bytes streamed per decode sweep.",
+      "Prefetch cannot be guaranteed to hide transfer latency; measure dependency critical paths."
+    ]
+  }
+]

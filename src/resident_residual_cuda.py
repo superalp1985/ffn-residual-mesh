@@ -1,0 +1,256 @@
+from __future__ import annotations
+
+import time
+
+import numpy as np
+import torch
+import triton
+import triton.language as tl
+
+from resident_residual_format import ResidentArtifact
+
+
+@triton.jit
+def _direct_q4k(raw, x, output, ROWS: tl.constexpr, COLS: tl.constexpr,
+                BLOCK_ROWS: tl.constexpr, BLOCK_COLS: tl.constexpr):
+    row = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    col = tl.arange(0, BLOCK_COLS)
+    mask = (row[:, None] < ROWS) & (col[None, :] < COLS)
+    block = raw + row[:, None] * (COLS // 256 * 144) + col[None, :] // 256 * 144
+    d_bits = tl.load(block, mask, other=0).to(tl.uint32) | (tl.load(block + 1, mask, other=0).to(tl.uint32) << 8)
+    m_bits = tl.load(block + 2, mask, other=0).to(tl.uint32) | (tl.load(block + 3, mask, other=0).to(tl.uint32) << 8)
+    d = d_bits.to(tl.uint16).to(tl.float16, bitcast=True).to(tl.float32)
+    dm = m_bits.to(tl.uint16).to(tl.float16, bitcast=True).to(tl.float32)
+    group = (col[None, :] % 256) // 32
+    low_scale = tl.load(block + 4 + group % 4, mask, other=0).to(tl.int32)
+    low_min = tl.load(block + 8 + group % 4, mask, other=0).to(tl.int32)
+    mix = tl.load(block + 12 + group % 4, mask, other=0).to(tl.int32)
+    scale = tl.where(group < 4, low_scale & 63, (mix & 15) | ((low_scale >> 2) & 48))
+    minimum = tl.where(group < 4, low_min & 63, (mix >> 4) | ((low_min >> 2) & 48))
+    packed = tl.load(block + 16 + (col[None, :] % 256) // 64 * 32 + col[None, :] % 32, mask, other=0).to(tl.int32)
+    q = (packed >> ((group % 2) * 4)) & 15
+    weight = (d * scale.to(tl.float32)) * q.to(tl.float32) - dm * minimum.to(tl.float32)
+    activation = tl.load(x + col, col < COLS, other=0)
+    dot = tl.sum(weight * activation[None, :], axis=1)
+    tl.store(output + row, dot, row < ROWS)
+
+
+@triton.jit
+def _direct_iq4nl(raw, x, partial, kvalues, ROWS: tl.constexpr, COLS: tl.constexpr,
+                  CHUNKS: tl.constexpr, CHUNK_COLS: tl.constexpr,
+                  BLOCK_ROWS: tl.constexpr, BLOCK_COLS: tl.constexpr):
+    row = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    chunk = tl.program_id(1)
+    local = tl.arange(0, BLOCK_COLS)
+    col = chunk * CHUNK_COLS + local
+    mask = (row[:, None] < ROWS) & (local[None, :] < CHUNK_COLS) & (col[None, :] < COLS)
+    block = raw + row[:, None] * (COLS // 32 * 18) + col[None, :] // 32 * 18
+    d_bits = tl.load(block, mask, other=0).to(tl.uint32) | (tl.load(block + 1, mask, other=0).to(tl.uint32) << 8)
+    d = tl.cast(d_bits.to(tl.uint16), tl.float16, bitcast=True).to(tl.float32)
+    packed = tl.load(block + 2 + col[None, :] % 16, mask, other=0).to(tl.int32)
+    q = (packed >> (((col[None, :] % 32) // 16) * 4)) & 15
+    weight = d * tl.load(kvalues + q, q < 16, other=0).to(tl.float32)
+    activation = tl.load(x + col, col < COLS, other=0)
+    dot = tl.sum(weight * activation[None, :], axis=1)
+    tl.store(partial + row * CHUNKS + chunk, dot, row < ROWS)
+
+
+class DirectQ4Projection:
+    def __init__(self, raw: np.ndarray, cols: int, *, block_rows: int = 1, num_warps: int = 4):
+        if raw.dtype != np.uint8 or raw.ndim != 2 or cols % 256 or raw.shape[1] != cols // 256 * 144:
+            raise ValueError("expected row-major raw Q4_K tensor")
+        self.raw = torch.from_numpy(np.array(raw, copy=True)).cuda()
+        self.rows, self.cols = raw.shape[0], cols
+        self.block_rows, self.num_warps = block_rows, num_warps
+        self.output = torch.empty(self.rows, device="cuda")
+
+    def launch(self, device_x: torch.Tensor) -> None:
+        _direct_q4k[(triton.cdiv(self.rows, self.block_rows),)](
+            self.raw, device_x, self.output, ROWS=self.rows, COLS=self.cols,
+            BLOCK_ROWS=self.block_rows, BLOCK_COLS=triton.next_power_of_2(self.cols),
+            num_warps=self.num_warps, enable_fp_fusion=False,
+        )
+
+
+class DirectIQ4NLProjection:
+    def __init__(self, raw: np.ndarray, cols: int, *, chunk_cols: int = 4096,
+                 block_rows: int = 1, num_warps: int = 4):
+        if raw.dtype != np.uint8 or raw.ndim != 2 or cols % 32 or raw.shape[1] != cols // 32 * 18:
+            raise ValueError("expected row-major raw IQ4_NL tensor")
+        self.raw = torch.from_numpy(np.array(raw, copy=True)).cuda()
+        self.kvalues = torch.tensor(
+            (-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113),
+            dtype=torch.float32, device="cuda",
+        )
+        self.rows, self.cols = raw.shape[0], cols
+        if chunk_cols <= 0 or chunk_cols % 32:
+            raise ValueError("chunk_cols must be a positive multiple of 32")
+        self.chunk_cols = min(chunk_cols, cols)
+        self.chunks = (cols + self.chunk_cols - 1) // self.chunk_cols
+        self.block_rows, self.num_warps = block_rows, num_warps
+        self.output = torch.empty(self.rows, device="cuda")
+        self.partial = torch.empty((self.rows, self.chunks), device="cuda")
+
+    def launch(self, device_x: torch.Tensor) -> None:
+        _direct_iq4nl[(triton.cdiv(self.rows, self.block_rows), self.chunks)](
+            self.raw, device_x, self.partial, self.kvalues, ROWS=self.rows, COLS=self.cols,
+            CHUNKS=self.chunks, CHUNK_COLS=self.chunk_cols,
+            BLOCK_ROWS=self.block_rows, BLOCK_COLS=triton.next_power_of_2(self.chunk_cols),
+            num_warps=self.num_warps, enable_fp_fusion=False,
+        )
+        torch.sum(self.partial, dim=1, out=self.output)
+
+
+@triton.jit
+def _residual_dot(packed, alpha, x, output, ROWS: tl.constexpr, COLS: tl.constexpr,
+                  BLOCK_ROWS: tl.constexpr, BLOCK_COLS: tl.constexpr):
+    row = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    col = tl.arange(0, BLOCK_COLS)
+    mask = (row[:, None] < ROWS) & (col[None, :] < COLS)
+    value = tl.load(packed + row[:, None] * (COLS // 2) + col[None, :] // 2, mask, other=0)
+    q = ((value.to(tl.int32) >> ((col[None, :] % 2) * 4)) & 15)
+    r = tl.where(q >= 8, q - 16, q).to(tl.float32)
+    scale = tl.load(alpha + row[:, None] * (COLS // 32) + col[None, :] // 32, mask, other=0)
+    activation = tl.load(x + col, col < COLS, other=0)
+    dot = tl.sum(r * scale * activation[None, :], axis=1)
+    tl.store(output + row, dot, row < ROWS)
+
+
+@triton.jit
+def _merge_swiglu(gate_r, up_r, gate_base, up_base, gate, up, output,
+                  ROWS: tl.constexpr, BLOCK: tl.constexpr):
+    index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = index < ROWS
+    g = tl.load(gate_r + index, mask, other=0) + tl.load(gate_base + index, mask, other=0)
+    u = tl.load(up_r + index, mask, other=0) + tl.load(up_base + index, mask, other=0)
+    tl.store(gate + index, g, mask)
+    tl.store(up + index, u, mask)
+    tl.store(output + index, g * tl.sigmoid(g) * u, mask)
+
+
+class ResidentGateUp:
+    """Single-flight gate/up probe. Down and layer paging are deliberately outside its scope."""
+
+    def __init__(self, artifact: ResidentArtifact, *, block_rows: int = 1, num_warps: int = 4):
+        if block_rows not in (1, 2, 4, 8) or num_warps not in (4, 8):
+            raise ValueError("invalid kernel launch configuration")
+        if not all(p in artifact.projections for p in ("gate", "up")):
+            raise ValueError("both gate and up must have compiled Q4_K projections")
+        self.rows = artifact.projections["gate"]["rows"]
+        self.cols = artifact.projections["gate"]["cols"]
+        if any((artifact.projections[p]["rows"], artifact.projections[p]["cols"]) != (self.rows, self.cols)
+               for p in ("gate", "up")):
+            raise ValueError("gate/up dimensions differ")
+        self.block_rows, self.num_warps = block_rows, num_warps
+        self.stream = torch.cuda.Stream()
+        self.host_x = torch.empty(self.cols, dtype=torch.float32, pin_memory=True)
+        self.host_base = {p: torch.empty(self.rows, dtype=torch.float32, pin_memory=True) for p in ("gate", "up")}
+        self.coefficient = {p: artifact.arrays[p]["coefficient"] for p in ("gate", "up")}
+        self.device_x = torch.empty(self.cols, dtype=torch.float32, device="cuda")
+        self.weights = {}
+        self.base, self.residual, self.output = {}, {}, {}
+        self.resident_bytes = 0
+        for p in ("gate", "up"):
+            self.weights[p] = {}
+            for kind in ("residual", "alpha"):
+                value = torch.from_numpy(np.array(artifact.arrays[p][kind], copy=True)).cuda()
+                self.weights[p][kind] = value
+                self.resident_bytes += value.numel() * value.element_size()
+            self.base[p] = torch.empty(self.rows, device="cuda")
+            self.residual[p] = torch.empty(self.rows, device="cuda")
+            self.output[p] = torch.empty(self.rows, device="cuda")
+        self.output["swiglu"] = torch.empty(self.rows, device="cuda")
+        torch.cuda.synchronize()
+        self.events = [torch.cuda.Event(enable_timing=True) for _ in range(7)]
+        self.traffic = dict(weight_upload_bytes=self.resident_bytes, dynamic_h2d_bytes=0,
+                            validation_d2h_bytes=0, weight_h2d_bytes_per_run=0)
+
+    def launch_residuals(self) -> None:
+        resources = []
+        for p in ("gate", "up"):
+            kernel = _residual_dot[(triton.cdiv(self.rows, self.block_rows),)](
+                self.weights[p]["residual"], self.weights[p]["alpha"], self.device_x,
+                self.residual[p], ROWS=self.rows, COLS=self.cols,
+                BLOCK_ROWS=self.block_rows, BLOCK_COLS=triton.next_power_of_2(self.cols),
+                num_warps=self.num_warps, enable_fp_fusion=False,
+            )
+            resources.append({"projection": p, "registers_per_thread": kernel.n_regs,
+                              "spills": kernel.n_spills, "shared_bytes": kernel.metadata.shared})
+        self.kernel_resources = resources
+
+    def run(self, x: np.ndarray, *, return_outputs: bool = True, down=None) -> dict:
+        values = np.asarray(x, dtype=np.float32)
+        if values.shape != (self.cols,) or not np.isfinite(values).all():
+            raise ValueError("finite one-token activation required")
+        if down is not None and (down.cols != self.rows or down.rows != self.cols):
+            raise ValueError("down projection dimensions must reverse gate/up dimensions")
+        # Completion at the end of each run protects pinned buffers from premature reuse.
+        begin = time.perf_counter()
+        self.host_x.numpy()[:] = values
+        e0, e1, e2, e3, e4, e5, e6 = self.events
+        with torch.cuda.stream(self.stream):
+            e0.record()
+            self.device_x.copy_(self.host_x, non_blocking=True)
+            e1.record()
+            self.launch_residuals()
+            e2.record()
+        cpu_begin = time.perf_counter()
+        sums = values.astype(np.float64).reshape(-1, 32).sum(axis=1)
+        for p in ("gate", "up"):
+            self.host_base[p].numpy()[:] = self.coefficient[p] @ sums
+        cpu_ms = (time.perf_counter() - cpu_begin) * 1000
+        with torch.cuda.stream(self.stream):
+            e3.record()
+            for p in ("gate", "up"):
+                self.base[p].copy_(self.host_base[p], non_blocking=True)
+            e4.record()
+            _merge_swiglu[(triton.cdiv(self.rows, 256),)](
+                self.residual["gate"], self.residual["up"], self.base["gate"], self.base["up"],
+                self.output["gate"], self.output["up"], self.output["swiglu"],
+                ROWS=self.rows, BLOCK=256, num_warps=4, enable_fp_fusion=False,
+            )
+            e5.record()
+            if down is not None:
+                down.launch(self.output["swiglu"])
+            e6.record()
+        e6.synchronize()
+        wall_ms = (time.perf_counter() - begin) * 1000
+        dynamic = 4 * (self.cols + 2 * self.rows)
+        self.traffic["dynamic_h2d_bytes"] += dynamic
+        result = {
+            "timing": {
+                "wall_ms": wall_ms, "cpu_base_ms": cpu_ms,
+                "activation_h2d_ms": e0.elapsed_time(e1),
+                "residual_stream_span_ms": e1.elapsed_time(e2),
+                "exposed_cpu_submission_gap_ms": e2.elapsed_time(e3),
+                "base_h2d_ms": e3.elapsed_time(e4),
+                "merge_stream_span_ms": e4.elapsed_time(e5),
+                "down_stream_span_ms": e5.elapsed_time(e6) if down is not None else 0.0,
+                "stream_span_ms": e0.elapsed_time(e6),
+            },
+            "dynamic_h2d_bytes": dynamic,
+        }
+        if return_outputs:
+            result.update({p: tensor.cpu().numpy() for p, tensor in self.output.items()})
+            if down is not None:
+                result["down"] = down.output.cpu().numpy()
+                self.traffic["validation_d2h_bytes"] += down.rows * 4
+            self.traffic["validation_d2h_bytes"] += self.rows * 3 * 4
+        return result
+
+    def graph_kernel_ms(self, repeats: int = 20) -> float:
+        """Launch-overhead-reduced kernel span, NOT hardware occupancy."""
+        with torch.cuda.stream(self.stream):
+            self.launch_residuals()
+        self.stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=self.stream):
+            self.launch_residuals()
+        begin, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        with torch.cuda.stream(self.stream):
+            begin.record()
+            for _ in range(repeats):
+                graph.replay()
+            end.record()
+        end.synchronize()
+        return begin.elapsed_time(end) / repeats

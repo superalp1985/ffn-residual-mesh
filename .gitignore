@@ -4,6 +4,7 @@ runtime/**
 data/raw/**
 data/cache/**
 data/outputs/**
+data/resident_*/
 *.gguf
 *.safetensors
 *.bin

@@ -83,6 +83,25 @@ minimize   GPU wait and synchronization
 subject to exactness or an explicit error budget
 ```
 
+## Qwen3.8-27B status
+
+The first real artifact and CUDA measurement are intentionally narrow:
+
+- one Q4_K gate/up layer is compiled offline; unsupported mixed quantizers remain
+  exact fallback;
+- gate/up and an IQ4_NL down projection are measured on synthetic inputs;
+- the measured single-layer output relative error is about `2.1e-7`;
+- runtime dynamic H2D is `159,744` bytes for the tested one-token layer, with
+  zero residual-weight H2D after initialization;
+- the current exact gate/up resident package is **larger** than the original
+  Q4_K gate/up bytes because FP32 scales and explicit residual metadata are
+  retained;
+- the complete 64-layer FFN package is estimated at about `9.24 GiB` before
+  attention workspace, so an 8 GiB GPU still requires a window/fallback policy.
+
+These are layer-level measurements, not a 27B end-to-end token-rate claim.
+`results/` contains the raw reports; every report lists what remains unmeasured.
+
 ## Why This Is Different
 
 Generic distributed inference splits tensors across devices. FFN Residual Mesh targets a narrower systems problem:

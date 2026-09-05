@@ -10,6 +10,25 @@
 
 **Spec:** `docs/math_principles_report.md`, `docs/log/2026-09-05-iteration-50.md`
 
+## Execution Status (2026-09-05, Iteration 52)
+
+- [x] Task 1: structural GGUF validation and local digest. Upstream digest comparison unavailable.
+- [x] Task 2: chunked exact Q4_K gate/up artifact and independent decoder tests.
+- [x] Task 3: resident packed residual kernel, upload accounting, numerical gate and byte/timing sweep.
+- [ ] Task 4: runtime window scheduler. Capacity planner implemented; async paging is NOT implemented.
+- [ ] Task 5: general mixed-format integration. Layer 3 Q4_K gate/up + IQ4_NL down measured;
+  other down types, complete model input captures and fallback policy remain.
+- [ ] Task 6: end-to-end generation. Not implemented; no 20 token/s claim.
+
+Corrections to original assumptions: the file has 64 main layers plus one MTP
+block and multiple quantization types, not uniform Q4_K. Expanded alpha/beta
+are FP32 in exact v1, not silently rounded FP16. Four-bit signed residuals
+are not smaller than four-bit codes; the current resident gate/up package is
+11.1% larger than its Q4_K source. Only five layers have both gate/up Q4_K.
+Do not expand to full-model execution before a viable memory/traffic policy.
+
+See `docs/log/2026-09-05-iteration-52.md` for measured scope and limitations.
+
 ## Global Constraints
 
 - Do not make radix lookup a runtime prerequisite.
