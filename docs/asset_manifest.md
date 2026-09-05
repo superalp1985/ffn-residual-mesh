@@ -1,31 +1,57 @@
-# 本地实验资产
+# Asset Manifest
 
-记录日期：2026-09-02
+本文件只记录可下载入口、下载状态和后续校验位置。开始实验前必须完成 SHA256 与 GGUF 张量校验。
 
-## 模型
+## Qwen3.8-27B
 
-- 来源：`E:\AccountingDemo-小企业会计\models\qwen3.5-2b-q4km`
-- 本地副本：`D:\ffn-residual-lab\models\qwen3.5-2b-q4km`
-- 文件：`Qwen3.5-2B-Q4_K_M.gguf`
-- 文件大小：1,280,835,840 bytes
-- 格式：GGUF，Q4_K_M
-- SHA256：`AAF42C8B7C3CAB2BF3D69C355048D4A0EE9973D48F16C731C0520EE914699223`
+- Model card: https://huggingface.co/Qwen/Qwen3.8-27B
+- File list: https://huggingface.co/Qwen/Qwen3.8-27B/tree/main
+- Recommended complete GGUF for this experiment:
+  - [Qwen3.8-27B-UD-Q4_K_M.gguf, 16.5 GB](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/main/Qwen3.8-27B-UD-Q4_K_M.gguf?download=true)
+- Matching GGUF metadata:
+  - [config.json](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/main/config.json?download=true)
+  - [imatrix_unsloth.gguf](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/main/imatrix_unsloth.gguf?download=true)
+- Official Transformers source (not required for the first GGUF experiment):
+  - [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B)
+- Existing model card report: `hidden=5120`, `ffn=17408`, `layers=64`.
 
-## 推理运行库
+Download requirements:
 
-- CPU：`runtime/llama_cpp`
-- CUDA：`runtime/llama_cpp_cuda`
-- 来源：`E:\AccountingDemo-小企业会计\runtime`
-- 入口：`llama-server.exe`、`llama-cli.exe`、`llama-bench.exe`
+```text
+at least one complete Q4_K or Q4_K_M GGUF
+one matching tokenizer set
+one matching config.json
+```
 
-## 本机硬件探针
+Do not download a separate partial GGUF shard unless all shards are placed in
+the same directory. FDM may be used for `.../resolve/main/...` file URLs.
 
-- GPU：NVIDIA GeForce RTX 4070 Laptop GPU
-- 显存：8188 MiB（探针可用 8187 MiB）
-- Compute Capability：8.9
-- 驱动：610.62
-- llama.cpp build：9851（commit `0eca4d490`）
+## Required experiment environment
 
-## 资产策略
+The local machine already has:
 
-模型和运行库不提交 Git。提交中只保留本文件、版本信息和实验结果摘要。
+```text
+Python 3.12.10
+PyTorch 2.9.1+cu130
+CUDA 13.0
+RTX 4070 Laptop 8188 MiB
+System RAM 32 GiB
+```
+
+No additional runtime download is needed for the first resident-residual layer
+prototype. CUDA toolkit and PyTorch are already available locally.
+
+## To add after download
+
+1. Place the complete GGUF under `models/qwen3.8-27b/`.
+2. Record the exact filename, byte size, SHA256, and source URL.
+3. Confirm tensor names for `ffn_gate`, `ffn_up`, and `ffn_down`.
+4. Confirm `hidden_size`, `intermediate_size`, and `num_hidden_layers`.
+5. Update `results/qwen38_27b_download_manifest.json`.
+
+## Uncertain URLs
+
+The recommended file is the complete Unsloth UD-Q4_K_M model. It is a 16.5 GB
+download; FDM can use the direct `resolve/main` URL above. Do not download
+`mmproj-BF16.gguf` or `mmproj-F16.gguf` for the first text-only FFN experiment;
+those are only needed for vision/video input.
