@@ -15,7 +15,10 @@
 - [x] Task 1: structural GGUF validation and local digest. Upstream digest comparison unavailable.
 - [x] Task 2: chunked exact Q4_K gate/up artifact and independent decoder tests.
 - [x] Task 3: resident packed residual kernel, upload accounting, numerical gate and byte/timing sweep.
-- [ ] Task 4: runtime window scheduler. Capacity planner implemented; async paging is NOT implemented.
+- [x] Task 4: runtime window scheduler and synchronous CUDA package cache.
+  Capacity policy, pinned host buffers, real miss/hit H2D accounting, eviction
+  safety, and kernel leases are implemented. Deferred async paging is NOT
+  implemented.
 - [ ] Task 5: general mixed-format integration. Layer 3 Q4_K gate/up + IQ4_NL down measured;
   other down types, complete model input captures and fallback policy remain.
 - [ ] Task 6: end-to-end generation. Not implemented; no 20 token/s claim.
