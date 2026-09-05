@@ -74,7 +74,12 @@ class ResidentWindowScheduler:
             raise ValueError("layer package must have positive bytes")
         self._layers[layer] = _Layer(layer=layer, bytes=total)
 
-    def set_persistent_layers(self, layers: tuple[int, ...] | list[int]) -> None:
+    def set_persistent_layers(
+        self,
+        layers: tuple[int, ...] | list[int],
+        *,
+        mark_resident: bool = True,
+    ) -> None:
         """Declare already uploaded persistent packages (cold-start ledger)."""
         requested = {int(layer) for layer in layers}
         self._require_known(requested)
@@ -90,7 +95,8 @@ class ResidentWindowScheduler:
         for layer in requested:
             entry = self._layers[layer]
             entry.persistent = True
-            entry.resident = True
+            if mark_resident:
+                entry.resident = True
         self._persistent.update(requested)
 
     def prefetch_window(self, first_layer: int) -> dict[str, object]:
@@ -110,7 +116,7 @@ class ResidentWindowScheduler:
         needed = target - self._resident() - self._pending
         extra = sum(self._layers[layer].bytes for layer in needed)
         try:
-            self._make_room(extra, protected=target)
+            evicted = self._make_room(extra, protected=target)
         except ResidencyError:
             self.traffic["blocked_prefetches"] += 1
             raise
@@ -124,6 +130,7 @@ class ResidentWindowScheduler:
             "planned_h2d_bytes": planned,
             "used_bytes": self.used_bytes(),
             "free_bytes": self.capacity_bytes - self.used_bytes(include_reserve=False),
+            "evicted_layers": evicted,
         }
 
     def complete_prefetch(self, layer: int) -> dict[str, object]:
@@ -163,6 +170,14 @@ class ResidentWindowScheduler:
             transfer = {"layer": layer, "resident_hit": True, "weight_h2d_bytes": 0}
         entry.active = True
         return transfer
+
+    def activate_layer(self, layer: int) -> None:
+        """Mark a completed resident copy as active without charging traffic."""
+        self._require_known({layer})
+        entry = self._layers[layer]
+        if not entry.resident or layer in self._pending:
+            raise ResidencyError(f"layer {layer} is not ready for activation")
+        entry.active = True
 
     def release_layer(self, layer: int) -> None:
         self._require_known({layer})
@@ -225,6 +240,10 @@ class ResidentWindowScheduler:
     def active_layers(self) -> list[int]:
         return sorted(entry.layer for entry in self._layers.values() if entry.active)
 
+    def layer_bytes(self, layer: int) -> int:
+        self._require_known({int(layer)})
+        return self._layers[int(layer)].bytes
+
     def pending_layers(self) -> list[int]:
         return sorted(self._pending)
 
@@ -259,12 +278,12 @@ class ResidentWindowScheduler:
         if unknown:
             raise KeyError(f"unregistered layers: {sorted(unknown)}")
 
-    def _make_room(self, extra: int, *, protected: set[int]) -> None:
+    def _make_room(self, extra: int, *, protected: set[int]) -> list[int]:
         if extra < 0:
             raise ValueError("extra bytes must be non-negative")
         required = self.used_bytes(include_reserve=False) + extra - self.capacity_bytes
         if required <= 0:
-            return
+            return []
         candidates = [
             entry for entry in self._layers.values()
             if entry.resident
@@ -280,8 +299,11 @@ class ResidentWindowScheduler:
                 "prefetch would overcommit VRAM and no safe transient eviction exists"
             )
         reclaimed = 0
+        evicted: list[int] = []
         for victim in candidates:
             self.evict_layer(victim.layer)
             reclaimed += victim.bytes
+            evicted.append(victim.layer)
             if reclaimed >= required:
-                return
+                return evicted
+        return evicted
