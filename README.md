@@ -98,6 +98,9 @@ Generic distributed inference splits tensors across devices. FFN Residual Mesh t
 The repository currently contains:
 
 - Exact integer-domain FFN base/residual reconstruction tests.
+- A native AVX2 CPU evaluator with software-prefetch distance sweeps and a
+  direct packed-Q4 comparison. It is deliberately labeled as a benchmark, not
+  as a claim that lookup always wins.
 - CUDA layer-level CPU-base + GPU-residual + SwiGLU/down bridge experiments.
 - MiniMax H3 ComfyUI analytical simulation using the local H3 tensor layout.
 - TeaCache real/reuse-step accounting.
@@ -115,6 +118,25 @@ Default workload: 832x480, 124 frames, 20 sampling steps, 8 TeaCache real steps,
 | Hidden approximation | 1 Gb/s | ~157.5 MiB per real step, but not algebraically exact |
 
 This is an **analytical model, not an Android benchmark**. It supports the hardware decision: start with USB/10GbE tablets, not ordinary Wi-Fi phones, for the exact path.
+
+### CPU Lookup Performance Note
+
+The cold-expanded table is much larger than the source Q4 stream. On the local
+i7-14650HX, Qwen3.5-2B layer 23, block-4, one token:
+
+```text
+direct packed-Q4 AVX2                 ~0.76 ms / projection
+old table evaluator                   ~2.26 ms / projection
+fused AVX2 table + software prefetch  ~1.27 ms / projection
+```
+
+At eight workers the fused table reaches roughly `0.23–0.27 ms` per projection,
+close to the local direct-Q4 baseline (`~0.20–0.23 ms`). Block-2 remains slower
+because it performs more table-address selections. These are warm local CPU
+microbenchmarks; they exclude file I/O and are not a full-model or Android
+result. The practical rule is: use pre-expanded tables only when their lookup
+locality beats the native packed-Q4 kernel; otherwise keep the table as an exact
+oracle and use the direct/worker path.
 
 ## Quick Start
 
