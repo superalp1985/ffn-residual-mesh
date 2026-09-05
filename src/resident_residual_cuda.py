@@ -116,6 +116,38 @@ def _residual_dot(packed, alpha, x, output, ROWS: tl.constexpr, COLS: tl.constex
     tl.store(output + row, dot, row < ROWS)
 
 
+def launch_residual_tile(
+    packed: torch.Tensor,
+    alpha: torch.Tensor,
+    device_x: torch.Tensor,
+    output: torch.Tensor,
+    *,
+    rows: int,
+    cols: int,
+    block_rows: int = 1,
+    num_warps: int = 4,
+) -> None:
+    """Launch the resident residual dot for one independently transferred tile."""
+    if packed.device.type != "cuda" or alpha.device.type != "cuda":
+        raise ValueError("packed and alpha must be CUDA tensors")
+    if device_x.device.type != "cuda" or output.device.type != "cuda":
+        raise ValueError("activation and output must be CUDA tensors")
+    if rows < 1 or cols < 32 or cols % 32 or block_rows not in (1, 2, 4, 8):
+        raise ValueError("invalid tile dimensions")
+    if packed.shape != (rows, cols // 2):
+        raise ValueError("packed shape does not match tile dimensions")
+    if alpha.shape != (rows, cols // 32):
+        raise ValueError("alpha shape does not match tile dimensions")
+    if device_x.numel() != cols or output.numel() != rows:
+        raise ValueError("activation/output shape does not match tile dimensions")
+    _residual_dot[(triton.cdiv(rows, block_rows),)](
+        packed, alpha, device_x, output,
+        ROWS=rows, COLS=cols,
+        BLOCK_ROWS=block_rows, BLOCK_COLS=triton.next_power_of_2(cols),
+        num_warps=num_warps, enable_fp_fusion=False,
+    )
+
+
 @triton.jit
 def _merge_swiglu(gate_r, up_r, gate_base, up_base, gate, up, output,
                   ROWS: tl.constexpr, BLOCK: tl.constexpr):
