@@ -151,6 +151,7 @@ The first hardware milestone is a Windows host with an RTX 4070-class GPU and on
 - `docs/weight_code_split_spec.md`: split/merge contract and runtime restrictions.
 - `docs/comfyui_phone_cluster_design.md`: MiniMax H3 and ComfyUI worker architecture.
 - `docs/release/v0.1.0-rc2.md`: release-ready algorithm explanation and claims.
+- `docs/release/ffn_residual_mesh_math_note_bingqin_wang.md`: short mathematical derivation signed by Bingqin WANG, suitable for a GitHub Release attachment.
 - `scripts/simulate_comfyui_phone_ffn.py`: H3/ComfyUI phone-link simulation.
 - `scripts/simulate_phone_ffn_cluster.py`: distributed FFN base-worker budget model.
 - `src/phone_ffn_loopback.py`: framed worker protocol, checksum, concurrency, deadline, fallback.
