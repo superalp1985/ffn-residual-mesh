@@ -25,6 +25,7 @@ class TiledResidentGateUp:
         tile_rows: int = 1024,
         persistent: bool = False,
         base_on_gpu: bool = False,
+        use_cuda_graph: bool = False,
         device: str | torch.device = "cuda",
     ) -> None:
         if not torch.cuda.is_available():
@@ -32,6 +33,7 @@ class TiledResidentGateUp:
         self.artifact = artifact
         self.device = torch.device(device)
         self.base_on_gpu = bool(base_on_gpu)
+        self.use_cuda_graph = bool(use_cuda_graph)
         self.rows = int(artifact.projections["gate"]["rows"])
         self.cols = int(artifact.projections["gate"]["cols"])
         self.plan = TilePlan(
@@ -105,6 +107,72 @@ class TiledResidentGateUp:
         self.host_group_sums = torch.empty(
             self.cols // 32, dtype=torch.float32, pin_memory=True
         ) if self.base_on_gpu else None
+        self._cuda_graph: torch.cuda.CUDAGraph | None = None
+        self._graph_package: dict[str, torch.Tensor] | None = None
+        self._graph_down = None
+        self._graph_capture_ms = 0.0
+
+    def _capture_full_cuda_graph(self, down=None) -> None:
+        """Capture the fixed-shape resident super-tile path once."""
+        if self._cuda_graph is not None:
+            return
+        if not self.base_on_gpu or len(self.plan.tile_slices()) != 1:
+            raise RuntimeError("CUDA graph requires a resident full-layer GPU-base path")
+        if self.host_group_sums is None or self.device_group_sums is None:
+            raise RuntimeError("CUDA graph requires resident group-sum buffers")
+        self.cache.acquire(0)
+        self._graph_package = self.cache.package(0)
+        package = self._graph_package
+        assert package is not None
+
+        # Force Triton compilation and allocator activity before capture.
+        with torch.cuda.stream(self.stream):
+            self.device_x.copy_(self.host_x, non_blocking=True)
+            self.device_group_sums.copy_(self.host_group_sums, non_blocking=True)
+            launch_fused_gate_up_base_residual(
+                package["gate.residual"],
+                package["gate.alpha"],
+                package["up.residual"],
+                package["up.alpha"],
+                self.base_resident["gate"],
+                self.base_resident["up"],
+                self.device_group_sums,
+                self.device_x,
+                self.output["gate"],
+                self.output["up"],
+                self.output["swiglu"],
+                rows=self.rows,
+                cols=self.cols,
+            )
+            if down is not None:
+                down.launch(self.output["swiglu"])
+        self.stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        capture_begin = time.perf_counter()
+        with torch.cuda.graph(graph, stream=self.stream):
+            self.device_x.copy_(self.host_x, non_blocking=True)
+            self.device_group_sums.copy_(self.host_group_sums, non_blocking=True)
+            launch_fused_gate_up_base_residual(
+                package["gate.residual"],
+                package["gate.alpha"],
+                package["up.residual"],
+                package["up.alpha"],
+                self.base_resident["gate"],
+                self.base_resident["up"],
+                self.device_group_sums,
+                self.device_x,
+                self.output["gate"],
+                self.output["up"],
+                self.output["swiglu"],
+                rows=self.rows,
+                cols=self.cols,
+            )
+            if down is not None:
+                down.launch(self.output["swiglu"])
+        self.stream.synchronize()
+        self._cuda_graph = graph
+        self._graph_down = down
+        self._graph_capture_ms = (time.perf_counter() - capture_begin) * 1000
 
     def run(
         self,
@@ -118,6 +186,18 @@ class TiledResidentGateUp:
             raise ValueError("finite one-token activation required")
         if down is not None and (down.cols != self.rows or down.rows != self.cols):
             raise ValueError("down projection dimensions must reverse gate/up dimensions")
+        graph_down_compatible = (
+            self._cuda_graph is None or down is self._graph_down
+        )
+        if (
+            self.use_cuda_graph
+            and self.base_on_gpu
+            and len(self.plan.tile_slices()) == 1
+            and graph_down_compatible
+        ):
+            return self._run_full_cuda_graph(
+                x, down=down, return_outputs=return_outputs
+            )
         begin = time.perf_counter()
         self.host_x.numpy()[:] = x
         activation_begin = torch.cuda.Event(enable_timing=True)
@@ -235,7 +315,8 @@ class TiledResidentGateUp:
                     rows=self.rows,
                 )
                 merge_end.record()
-            if down is not None:
+        if down is not None:
+            with torch.cuda.stream(self.stream):
                 down_begin.record()
                 down.launch(self.output["swiglu"])
                 down_end.record()
@@ -283,6 +364,68 @@ class TiledResidentGateUp:
         }
         if down is not None:
             result["down_stream_ms"] = float(down_begin.elapsed_time(down_end))
+        if return_outputs:
+            result.update({
+                name: output.cpu().numpy()
+                for name, output in self.output.items()
+            })
+            if down is not None:
+                result["down"] = down.output.cpu().numpy()
+        return result
+
+    def _run_full_cuda_graph(
+        self,
+        x: np.ndarray,
+        *,
+        down=None,
+        return_outputs: bool,
+    ) -> dict[str, object]:
+        if self.host_group_sums is None:
+            raise RuntimeError("CUDA graph path requires GPU base buffers")
+        begin = time.perf_counter()
+        self.host_x.numpy()[:] = x
+        self._group_sums[:] = x.astype(np.float64).reshape(-1, 32).sum(axis=1)
+        self.host_group_sums.numpy()[:] = self._group_sums.astype(np.float32)
+        if self._cuda_graph is None:
+            self._capture_full_cuda_graph(down=down)
+        assert self._cuda_graph is not None
+        begin_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        with torch.cuda.stream(self.stream):
+            begin_event.record()
+            self._cuda_graph.replay()
+            end_event.record()
+        self.stream.synchronize()
+        wall_ms = (time.perf_counter() - begin) * 1000
+        graph_ms = float(begin_event.elapsed_time(end_event))
+        result: dict[str, object] = {
+            "cpu_base_ms": 0.0,
+            "activation_h2d_ms": 0.0,
+            "tile_kernel_ms": graph_ms,
+            "exposed_cpu_submission_gap_ms": 0.0,
+            "base_h2d_ms": 0.0,
+            "merge_swiglu_ms": 0.0,
+            "fused_base_residual_swiglu_ms": graph_ms,
+            "cuda_graph_replay_ms": graph_ms,
+            "cuda_graph_capture_ms": self._graph_capture_ms,
+            "wall_ms": wall_ms,
+            "activation_h2d_bytes": self.cols * 4,
+            "base_h2d_bytes": (self.cols // 32) * 4,
+            "base_resident_bytes": sum(
+                value.numel() * value.element_size()
+                for value in self.base_resident.values()
+            ),
+            "weight_h2d_bytes": self.cache.traffic["weight_h2d_bytes"],
+            "resident_weight_h2d_bytes": 0,
+            "tile_count": 1,
+            "base_compute_device": "cuda",
+            "kernel_mode": (
+                "cuda_graph_fused_base_residual_swiglu_down"
+                if down is not None
+                else "cuda_graph_fused_base_residual_swiglu"
+            ),
+            "graph_includes_down": down is not None,
+        }
         if return_outputs:
             result.update({
                 name: output.cpu().numpy()

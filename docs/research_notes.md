@@ -405,3 +405,37 @@ super-tile，并在同一个 kernel 内完成基项、残差和非线性合并�
 调度结论：常驻层采用整层 super-tile；换入层采用 1024--4096 行的粗 tile + 双缓冲；
 不要把 decode 的单 token 传输强行放大成 64/256 KiB 固定页。下一轮优先接 CUDA Graph
 固定形状回放和 Nsight 指标，再决定是否保留独立 base stream。
+
+## 2026-09-05 CUDA Graph 固定形状回放
+
+第 60 轮把常驻整层路径接入可选 CUDA Graph。图内固定：
+
+```text
+激活 H2D + group_sums H2D
+-> fused base/residual/SwiGLU
+-> 可选 resident down
+```
+
+图只对固定 shape、整层 resident、`base_on_gpu=True` 生效；多 tile、换入层或
+不同 down 对象自动回退到普通 stream 路径。图的 host 输入指针来自固定 pinned
+buffer，每次 replay 只更新 buffer 内容，不重新创建图。
+
+真实 Qwen3.8-27B Q4_K_M 单层 warm 测量，RTX 4070 Laptop：
+
+```text
+layer 3，含 down：普通路径约 1.93 ms，CUDA Graph 约 1.80 ms
+layer 21，含 down：普通路径约 2.30 ms，CUDA Graph 约 2.20 ms
+```
+
+这是单层 gate/up/SwiGLU/down 链路，不是完整生成速度。图捕获主要减少重复
+launch、事件和 stream 调度空隙；残差读取和 down 算术本身没有被“免费消除”。
+首次 capture 仍需约数毫秒到十余毫秒，属于冷启动成本。
+
+图路径同时通过了两个不同 activation 的重放校验，以及 fixture 和真实 Qwen
+层的 down 数值校验。下一步要用 Nsight Systems/Compute 把 wall-time 改善拆成
+H2D、kernel gap、SM active 和 down kernel 的实测证据，再决定是否作为默认策略。
+
+本机 Nsight Compute 2022.3 可以启动，但驱动拒绝性能计数器访问
+(`ERR_NVGPUCTRPERM`)，因此本轮没有伪造 occupancy 或 SM active 数字。脚本
+`scripts/profile_resident_cuda_graph.py` 已加入，后续在开启 GPU performance
+counter 权限的机器上可直接重放同样的采样。

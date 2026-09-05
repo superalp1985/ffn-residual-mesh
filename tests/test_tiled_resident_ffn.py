@@ -152,6 +152,82 @@ class TiledResidentFfnTests(unittest.TestCase):
                 cpu_runner.close()
                 gpu_runner.close()
 
+    def test_cuda_graph_replay_accepts_new_activation_and_preserves_output(self) -> None:
+        import torch
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA unavailable")
+        from tests.gguf_fixture import write_fixture
+        from compile_resident_residual_artifact import compile_layer
+        from resident_residual_format import ResidentArtifact
+        from resident_tiled_ffn import TiledResidentGateUp
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_fixture(root / "fixture.gguf")
+            compile_layer(root / "fixture.gguf", 0, 4, root / "artifact")
+            with ResidentArtifact.open(root / "artifact") as artifact:
+                runner = TiledResidentGateUp(
+                    artifact,
+                    tile_rows=256,
+                    persistent=True,
+                    base_on_gpu=True,
+                    use_cuda_graph=True,
+                )
+                x1 = np.random.default_rng(570).standard_normal(256).astype(np.float32)
+                x2 = np.random.default_rng(571).standard_normal(256).astype(np.float32)
+                first = runner.run(x1)
+                second = runner.run(x2)
+                expected_gate = artifact.reconstruct_weights("gate").astype(np.float64) @ x2
+                expected_up = artifact.reconstruct_weights("up").astype(np.float64) @ x2
+                np.testing.assert_allclose(second["gate"], expected_gate, rtol=2e-4, atol=2e-4)
+                np.testing.assert_allclose(second["up"], expected_up, rtol=2e-4, atol=2e-4)
+                self.assertEqual(first["kernel_mode"], "cuda_graph_fused_base_residual_swiglu")
+                self.assertEqual(second["base_h2d_bytes"], 32)
+                self.assertGreater(second["cuda_graph_replay_ms"], 0.0)
+                runner.close()
+
+    def test_cuda_graph_can_capture_resident_down_projection(self) -> None:
+        import torch
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA unavailable")
+        from tests.gguf_fixture import write_fixture
+        from compile_resident_residual_artifact import compile_layer
+        from resident_residual_cuda import DirectIQ4NLProjection
+        from resident_residual_format import ResidentArtifact
+        from resident_tiled_ffn import TiledResidentGateUp
+        from gguf import GGUFReader
+        from gguf.quants import dequantize
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_fixture(root / "fixture.gguf", quantized_down=True)
+            compile_layer(root / "fixture.gguf", 0, 4, root / "artifact")
+            with ResidentArtifact.open(root / "artifact") as artifact:
+                reader = GGUFReader(root / "fixture.gguf")
+                tensor = next(
+                    item for item in reader.tensors
+                    if item.name == "blk.0.ffn_down.weight"
+                )
+                down = DirectIQ4NLProjection(tensor.data, int(tensor.shape[0]))
+                x = np.random.default_rng(572).standard_normal(256).astype(np.float32)
+                with TiledResidentGateUp(
+                    artifact,
+                    tile_rows=256,
+                    persistent=True,
+                    base_on_gpu=True,
+                    use_cuda_graph=True,
+                ) as runner:
+                    result = runner.run(x, down=down)
+                    expected = (
+                        dequantize(tensor.data, tensor.tensor_type).astype(np.float64)
+                        @ result["swiglu"]
+                    )
+                    np.testing.assert_allclose(
+                        result["down"], expected, rtol=2e-4, atol=2e-4
+                    )
+                    self.assertTrue(result["graph_includes_down"])
+                reader.data._mmap.close()
+
 
 if __name__ == "__main__":
     unittest.main()

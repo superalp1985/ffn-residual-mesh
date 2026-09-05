@@ -254,6 +254,11 @@ repository reports layer wall time, H2D bytes, resident bytes, kernel gaps,
 and numerical error separately; a full model claim requires a multi-layer
 runner and profiler evidence.
 
+The same fixed-shape path can optionally be captured as a CUDA Graph, including
+an already resident down projection. This targets repeated launch and stream
+gaps during decode. Enable it with `use_cuda_graph=True`; multi-tile or swapped
+layers automatically stay on the ordinary asynchronous path.
+
 ## Contributing Hardware
 
 If you have an old Android phone, tablet, mini PC, or wired network adapter, useful contributions are:
