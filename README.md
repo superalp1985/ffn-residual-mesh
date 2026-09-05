@@ -232,6 +232,28 @@ The current evidence is layered and explicit:
 
 That boundary is part of the design. A result that cannot beat the GPU branch on real bytes, wait time, and overlap is not promoted as a default backend.
 
+## Current Dense-Feed Path
+
+For a fully resident layer, the CUDA runner now has a dense super-tile mode:
+
+```text
+Q4 residual dot
+  + resident coefficient · group_sums
+  -> gate/up merge
+  -> SwiGLU
+```
+
+The coefficient matrices are uploaded once at cold start. Each token sends
+only the 160-element group-sum vector for a 5120-wide Qwen3.8 FFN input
+(`640 B` in the current fp32 path). The fused kernel avoids writing residual
+vectors only to read them back for a second merge launch. Swapped layers still
+use coarse double-buffered tiles and the original exact fallback.
+
+This is an implementation result, not an end-to-end generation claim. The
+repository reports layer wall time, H2D bytes, resident bytes, kernel gaps,
+and numerical error separately; a full model claim requires a multi-layer
+runner and profiler evidence.
+
 ## Contributing Hardware
 
 If you have an old Android phone, tablet, mini PC, or wired network adapter, useful contributions are:

@@ -116,6 +116,147 @@ def _residual_dot(packed, alpha, x, output, ROWS: tl.constexpr, COLS: tl.constex
     tl.store(output + row, dot, row < ROWS)
 
 
+@triton.jit
+def _fused_gate_up_swiglu_tile(
+    gate_packed, gate_alpha, up_packed, up_alpha, x,
+    gate_base, up_base, gate_output, up_output, swiglu_output,
+    ROWS: tl.constexpr, COLS: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr, BLOCK_COLS: tl.constexpr,
+):
+    row = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    col = tl.arange(0, BLOCK_COLS)
+    mask = (row[:, None] < ROWS) & (col[None, :] < COLS)
+    packed_offset = row[:, None] * (COLS // 2) + col[None, :] // 2
+    shift = (col[None, :] % 2) * 4
+
+    gate_value = tl.load(gate_packed + packed_offset, mask, other=0).to(tl.int32)
+    gate_q = (gate_value >> shift) & 15
+    gate_r = tl.where(gate_q >= 8, gate_q - 16, gate_q).to(tl.float32)
+    gate_scale = tl.load(
+        gate_alpha + row[:, None] * (COLS // 32) + col[None, :] // 32,
+        mask,
+        other=0,
+    )
+
+    up_value = tl.load(up_packed + packed_offset, mask, other=0).to(tl.int32)
+    up_q = (up_value >> shift) & 15
+    up_r = tl.where(up_q >= 8, up_q - 16, up_q).to(tl.float32)
+    up_scale = tl.load(
+        up_alpha + row[:, None] * (COLS // 32) + col[None, :] // 32,
+        mask,
+        other=0,
+    )
+    activation = tl.load(x + col, col < COLS, other=0)
+    gate = tl.sum(gate_r * gate_scale * activation[None, :], axis=1)
+    up = tl.sum(up_r * up_scale * activation[None, :], axis=1)
+    row_mask = row < ROWS
+    gate += tl.load(gate_base + row, row_mask, other=0)
+    up += tl.load(up_base + row, row_mask, other=0)
+    tl.store(gate_output + row, gate, row_mask)
+    tl.store(up_output + row, up, row_mask)
+    tl.store(swiglu_output + row, gate * tl.sigmoid(gate) * up, row_mask)
+
+
+@triton.jit
+def _fused_gate_up_residual_tile(
+    gate_packed, gate_alpha, up_packed, up_alpha, x,
+    gate_output, up_output,
+    ROWS: tl.constexpr, COLS: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr, BLOCK_COLS: tl.constexpr,
+):
+    row = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    col = tl.arange(0, BLOCK_COLS)
+    mask = (row[:, None] < ROWS) & (col[None, :] < COLS)
+    packed_offset = row[:, None] * (COLS // 2) + col[None, :] // 2
+    shift = (col[None, :] % 2) * 4
+
+    gate_value = tl.load(gate_packed + packed_offset, mask, other=0).to(tl.int32)
+    gate_q = (gate_value >> shift) & 15
+    gate_r = tl.where(gate_q >= 8, gate_q - 16, gate_q).to(tl.float32)
+    gate_scale = tl.load(
+        gate_alpha + row[:, None] * (COLS // 32) + col[None, :] // 32,
+        mask,
+        other=0,
+    )
+
+    up_value = tl.load(up_packed + packed_offset, mask, other=0).to(tl.int32)
+    up_q = (up_value >> shift) & 15
+    up_r = tl.where(up_q >= 8, up_q - 16, up_q).to(tl.float32)
+    up_scale = tl.load(
+        up_alpha + row[:, None] * (COLS // 32) + col[None, :] // 32,
+        mask,
+        other=0,
+    )
+    activation = tl.load(x + col, col < COLS, other=0)
+    row_mask = row < ROWS
+    tl.store(
+        gate_output + row,
+        tl.sum(gate_r * gate_scale * activation[None, :], axis=1),
+        row_mask,
+    )
+    tl.store(
+        up_output + row,
+        tl.sum(up_r * up_scale * activation[None, :], axis=1),
+        row_mask,
+    )
+
+
+@triton.jit
+def _fused_gate_up_base_residual(
+    gate_packed, gate_alpha, up_packed, up_alpha,
+    gate_coeff, up_coeff, group_sums, x,
+    gate_output, up_output, swiglu_output,
+    ROWS: tl.constexpr, COLS: tl.constexpr, GROUPS: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr, BLOCK_COLS: tl.constexpr,
+    BLOCK_GROUPS: tl.constexpr,
+):
+    """Full super-tile path: resident residual + resident base in one launch."""
+    row = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    col = tl.arange(0, BLOCK_COLS)
+    group = tl.arange(0, BLOCK_GROUPS)
+    row_mask = row < ROWS
+    col_mask = col < COLS
+    group_mask = group < GROUPS
+    mask = row_mask[:, None] & col_mask[None, :]
+    packed_offset = row[:, None] * (COLS // 2) + col[None, :] // 2
+    shift = (col[None, :] % 2) * 4
+
+    gate_value = tl.load(gate_packed + packed_offset, mask, other=0).to(tl.int32)
+    gate_q = (gate_value >> shift) & 15
+    gate_r = tl.where(gate_q >= 8, gate_q - 16, gate_q).to(tl.float32)
+    gate_scale = tl.load(
+        gate_alpha + row[:, None] * (COLS // 32) + col[None, :] // 32,
+        mask, other=0,
+    )
+    up_value = tl.load(up_packed + packed_offset, mask, other=0).to(tl.int32)
+    up_q = (up_value >> shift) & 15
+    up_r = tl.where(up_q >= 8, up_q - 16, up_q).to(tl.float32)
+    up_scale = tl.load(
+        up_alpha + row[:, None] * (COLS // 32) + col[None, :] // 32,
+        mask, other=0,
+    )
+    activation = tl.load(x + col, col_mask, other=0).to(tl.float32)
+    gate_res = tl.sum(gate_r * gate_scale * activation[None, :], axis=1)
+    up_res = tl.sum(up_r * up_scale * activation[None, :], axis=1)
+
+    sums = tl.load(group_sums + group, group_mask, other=0).to(tl.float32)
+    gate_c = tl.load(
+        gate_coeff + row[:, None] * GROUPS + group[None, :],
+        row_mask[:, None] & group_mask[None, :],
+        other=0,
+    ).to(tl.float32)
+    up_c = tl.load(
+        up_coeff + row[:, None] * GROUPS + group[None, :],
+        row_mask[:, None] & group_mask[None, :],
+        other=0,
+    ).to(tl.float32)
+    gate = gate_res + tl.sum(gate_c * sums[None, :], axis=1)
+    up = up_res + tl.sum(up_c * sums[None, :], axis=1)
+    tl.store(gate_output + row, gate, row_mask)
+    tl.store(up_output + row, up, row_mask)
+    tl.store(swiglu_output + row, gate * tl.sigmoid(gate) * up, row_mask)
+
+
 def launch_residual_tile(
     packed: torch.Tensor,
     alpha: torch.Tensor,
@@ -145,6 +286,160 @@ def launch_residual_tile(
         ROWS=rows, COLS=cols,
         BLOCK_ROWS=block_rows, BLOCK_COLS=triton.next_power_of_2(cols),
         num_warps=num_warps, enable_fp_fusion=False,
+    )
+
+
+def launch_fused_gate_up_tile(
+    gate_packed: torch.Tensor,
+    gate_alpha: torch.Tensor,
+    up_packed: torch.Tensor,
+    up_alpha: torch.Tensor,
+    device_x: torch.Tensor,
+    gate_base: torch.Tensor,
+    up_base: torch.Tensor,
+    gate_output: torch.Tensor,
+    up_output: torch.Tensor,
+    swiglu_output: torch.Tensor,
+    *,
+    rows: int,
+    cols: int,
+    block_rows: int = 1,
+    num_warps: int = 4,
+) -> None:
+    tensors = (
+        gate_packed, gate_alpha, up_packed, up_alpha, device_x,
+        gate_base, up_base, gate_output, up_output, swiglu_output,
+    )
+    if any(tensor.device.type != "cuda" for tensor in tensors):
+        raise ValueError("fused gate/up tile requires CUDA tensors")
+    if rows < 1 or cols < 32 or cols % 32 or block_rows not in (1, 2, 4, 8):
+        raise ValueError("invalid fused tile dimensions")
+    if gate_packed.shape != (rows, cols // 2) or up_packed.shape != (rows, cols // 2):
+        raise ValueError("packed shape does not match fused tile dimensions")
+    if gate_alpha.shape != (rows, cols // 32) or up_alpha.shape != (rows, cols // 32):
+        raise ValueError("alpha shape does not match fused tile dimensions")
+    if any(tensor.numel() != rows for tensor in (
+        gate_base, up_base, gate_output, up_output, swiglu_output,
+    )):
+        raise ValueError("base/output shape does not match fused tile rows")
+    if device_x.numel() != cols:
+        raise ValueError("activation shape does not match fused tile columns")
+    _fused_gate_up_swiglu_tile[(triton.cdiv(rows, block_rows),)](
+        gate_packed, gate_alpha, up_packed, up_alpha, device_x,
+        gate_base, up_base, gate_output, up_output, swiglu_output,
+        ROWS=rows, COLS=cols,
+        BLOCK_ROWS=block_rows, BLOCK_COLS=triton.next_power_of_2(cols),
+        num_warps=num_warps, enable_fp_fusion=False,
+    )
+
+
+def launch_fused_gate_up_residual_tile(
+    gate_packed: torch.Tensor,
+    gate_alpha: torch.Tensor,
+    up_packed: torch.Tensor,
+    up_alpha: torch.Tensor,
+    device_x: torch.Tensor,
+    gate_output: torch.Tensor,
+    up_output: torch.Tensor,
+    *,
+    rows: int,
+    cols: int,
+    block_rows: int = 1,
+    num_warps: int = 8,
+) -> None:
+    tensors = (
+        gate_packed, gate_alpha, up_packed, up_alpha,
+        device_x, gate_output, up_output,
+    )
+    if any(tensor.device.type != "cuda" for tensor in tensors):
+        raise ValueError("fused residual tile requires CUDA tensors")
+    if rows < 1 or cols < 32 or cols % 32 or block_rows not in (1, 2, 4, 8):
+        raise ValueError("invalid fused residual tile dimensions")
+    if gate_packed.shape != (rows, cols // 2) or up_packed.shape != (rows, cols // 2):
+        raise ValueError("packed shape does not match fused residual tile dimensions")
+    if gate_alpha.shape != (rows, cols // 32) or up_alpha.shape != (rows, cols // 32):
+        raise ValueError("alpha shape does not match fused residual tile dimensions")
+    if device_x.numel() != cols or gate_output.numel() != rows or up_output.numel() != rows:
+        raise ValueError("activation/output shape does not match fused residual tile")
+    _fused_gate_up_residual_tile[(triton.cdiv(rows, block_rows),)](
+        gate_packed, gate_alpha, up_packed, up_alpha, device_x,
+        gate_output, up_output,
+        ROWS=rows, COLS=cols,
+        BLOCK_ROWS=block_rows, BLOCK_COLS=triton.next_power_of_2(cols),
+        num_warps=num_warps, enable_fp_fusion=False,
+    )
+
+
+def launch_fused_gate_up_base_residual(
+    gate_packed: torch.Tensor,
+    gate_alpha: torch.Tensor,
+    up_packed: torch.Tensor,
+    up_alpha: torch.Tensor,
+    gate_coeff: torch.Tensor,
+    up_coeff: torch.Tensor,
+    group_sums: torch.Tensor,
+    device_x: torch.Tensor,
+    gate_output: torch.Tensor,
+    up_output: torch.Tensor,
+    swiglu_output: torch.Tensor,
+    *,
+    rows: int,
+    cols: int,
+    block_rows: int = 1,
+    num_warps: int = 8,
+) -> None:
+    tensors = (
+        gate_packed, gate_alpha, up_packed, up_alpha,
+        gate_coeff, up_coeff, group_sums, device_x,
+        gate_output, up_output, swiglu_output,
+    )
+    if any(tensor.device.type != "cuda" for tensor in tensors):
+        raise ValueError("fused base/residual path requires CUDA tensors")
+    groups = cols // 32
+    if rows < 1 or cols < 32 or cols % 32 or block_rows not in (1, 2, 4, 8):
+        raise ValueError("invalid fused base/residual dimensions")
+    if gate_packed.shape != (rows, cols // 2) or up_packed.shape != (rows, cols // 2):
+        raise ValueError("packed shape does not match fused base/residual dimensions")
+    if gate_alpha.shape != (rows, groups) or up_alpha.shape != (rows, groups):
+        raise ValueError("alpha shape does not match fused base/residual dimensions")
+    if gate_coeff.shape != (rows, groups) or up_coeff.shape != (rows, groups):
+        raise ValueError("coefficient shape does not match fused base/residual dimensions")
+    if group_sums.numel() != groups or device_x.numel() != cols:
+        raise ValueError("activation/group shape does not match fused base/residual dimensions")
+    if any(tensor.numel() != rows for tensor in (gate_output, up_output, swiglu_output)):
+        raise ValueError("output shape does not match fused base/residual dimensions")
+    _fused_gate_up_base_residual[(triton.cdiv(rows, block_rows),)](
+        gate_packed, gate_alpha, up_packed, up_alpha,
+        gate_coeff, up_coeff, group_sums, device_x,
+        gate_output, up_output, swiglu_output,
+        ROWS=rows, COLS=cols, GROUPS=groups,
+        BLOCK_ROWS=block_rows, BLOCK_COLS=triton.next_power_of_2(cols),
+        BLOCK_GROUPS=triton.next_power_of_2(groups),
+        num_warps=num_warps, enable_fp_fusion=False,
+    )
+
+
+def launch_merge_swiglu(
+    gate_residual: torch.Tensor,
+    up_residual: torch.Tensor,
+    gate_base: torch.Tensor,
+    up_base: torch.Tensor,
+    gate_output: torch.Tensor,
+    up_output: torch.Tensor,
+    swiglu_output: torch.Tensor,
+    *,
+    rows: int,
+) -> None:
+    tensors = (
+        gate_residual, up_residual, gate_base, up_base,
+        gate_output, up_output, swiglu_output,
+    )
+    if any(tensor.device.type != "cuda" or tensor.numel() != rows for tensor in tensors):
+        raise ValueError("merge tensors must be CUDA vectors matching rows")
+    _merge_swiglu[(triton.cdiv(rows, 256),)](
+        gate_residual, up_residual, gate_base, up_base,
+        gate_output, up_output, swiglu_output,
+        ROWS=rows, BLOCK=256, num_warps=4, enable_fp_fusion=False,
     )
 
 

@@ -361,3 +361,47 @@ block=2、1024-row tile、10 次采样中，串行 critical path 约 1.80 ms，�
 第 43 轮把运行时 base 生产切换为 Python 线程池逐 tile 读取 radix partial-sum table。block=2、2048-row、8 线程下，base 生产约 300 ms，而 GPU copy/compute 仍只有约 1 ms；完整输出误差保持 `1.18e-4`。因此问题是 Python 小块循环和调度开销，不是拆分公式或合并精度。
 
 Python table mode 只保留为正确性 oracle，不能作为目标运行时性能结论。目标实现必须复用已有 C++ 常驻线程池 evaluator，再把 CPU base tile 与 QLO2 residual 一起接入 GPU full FFN 双缓冲链。
+
+## 2026-09-05 super-tile 基项/残差融合与 GPU 气泡
+
+第 59 轮针对 H2D、tile、kernel 之间的空隙做了两步改动：
+
+1. `base_on_gpu` 路径把每层的 gate/up coefficient 冷启动常驻显存；运行时只上传
+   `160` 个 fp32 分组和，约 `640 B/token`，不再上传 `17408 * 2` 个 fp32 基项，
+   后者约 `136 KiB/token`。
+2. 当整层 residual 已经常驻、且 tile_rows 等于整层行数时，使用一个 super-tile
+   kernel 同时完成：
+
+   ```text
+   Q4 residual dot + coefficient · group_sums + gate/up merge + SwiGLU
+   ```
+
+   这样去掉了 residual 中间向量写回、单独 base GEMV、以及第二次 merge launch。
+   多 tile 或换入层仍保留原来的粗粒度 tile 路径，不强行融合。
+
+fixture 和真实 Qwen3.8-27B 第 3、21 层均通过数值校验。真实层 warm A/B（RTX 4070
+Laptop，单 token，整层 resident，未包含 attention）：
+
+```text
+layer 3:  CPU-base 约 1.51 ms，GPU fused super-tile 约 1.41 ms
+layer 21: CPU-base 约 1.89 ms，GPU fused super-tile 约 1.33 ms
+```
+
+不同运行会有抖动，不能据此宣称模型端到端加速；但它证明了“把残差喂成一块密集
+super-tile，并在同一个 kernel 内完成基项、残差和非线性合并”比细碎的
+`residual -> base GEMV -> merge` 更接近目标调度形态。第 3 层收益较小，说明 kernel
+本身已接近瓶颈；第 21 层收益更明显，说明原 CPU base 生产/上传确实暴露了关键路径。
+
+当前实现的设备指标：
+
+- 动态 base H2D：`1280 B`（160 个 fp64 分组和）旧实现；新 fused 路径已降为
+  `640 B` fp32 分组和；
+- coefficient resident：gate/up 合计约 `22.3 MiB`（fp32）；
+- resident residual weight H2D：warm run 为 `0`；
+- 误差：fixture 与真实 artifact 的 gate/up 最大绝对误差保持在 `1e-6` 量级；
+- GPU 计算密度仍需用 Nsight Compute/Systems 读取 SM active、tensor/FP pipe active、
+  memcpy overlap 和 kernel gap，墙钟时间本身不能替代 occupancy 证据。
+
+调度结论：常驻层采用整层 super-tile；换入层采用 1024--4096 行的粗 tile + 双缓冲；
+不要把 decode 的单 token 传输强行放大成 64/256 KiB 固定页。下一轮优先接 CUDA Graph
+固定形状回放和 Nsight 指标，再决定是否保留独立 base stream。

@@ -39,6 +39,7 @@ class TiledResidentFfnTests(unittest.TestCase):
                 np.testing.assert_allclose(result["gate"], gate, rtol=1e-4, atol=1e-4)
                 np.testing.assert_allclose(result["up"], up, rtol=1e-4, atol=1e-4)
                 np.testing.assert_allclose(result["swiglu"], swiglu, rtol=2e-4, atol=2e-4)
+                self.assertEqual(result["kernel_mode"], "fused_residual_cpu_overlap_then_merge")
                 self.assertEqual(result["weight_h2d_bytes"], runner.cache.traffic["weight_h2d_bytes"])
                 self.assertEqual(result["resident_weight_h2d_bytes"], 0)
 
@@ -116,6 +117,40 @@ class TiledResidentFfnTests(unittest.TestCase):
                     np.testing.assert_allclose(result["down"], expected, rtol=2e-4, atol=2e-4)
                     self.assertIn("down_stream_ms", result)
                 reader.data._mmap.close()
+
+    def test_gpu_base_mode_keeps_coefficients_resident_and_reduces_base_upload(self) -> None:
+        import torch
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA unavailable")
+        from tests.gguf_fixture import write_fixture
+        from compile_resident_residual_artifact import compile_layer
+        from resident_residual_format import ResidentArtifact
+        from resident_tiled_ffn import TiledResidentGateUp
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_fixture(root / "fixture.gguf")
+            compile_layer(root / "fixture.gguf", 0, 4, root / "artifact")
+            with ResidentArtifact.open(root / "artifact") as artifact:
+                cpu_runner = TiledResidentGateUp(artifact, tile_rows=64, persistent=True)
+                gpu_runner = TiledResidentGateUp(
+                    artifact,
+                    tile_rows=256,
+                    persistent=True,
+                    base_on_gpu=True,
+                )
+                x = np.random.default_rng(569).standard_normal(256).astype(np.float32)
+                cpu = cpu_runner.run(x)
+                gpu = gpu_runner.run(x)
+                np.testing.assert_allclose(gpu["gate"], cpu["gate"], rtol=2e-4, atol=2e-4)
+                np.testing.assert_allclose(gpu["up"], cpu["up"], rtol=2e-4, atol=2e-4)
+                np.testing.assert_allclose(gpu["swiglu"], cpu["swiglu"], rtol=3e-4, atol=3e-4)
+                self.assertEqual(gpu["base_compute_device"], "cuda")
+                self.assertEqual(gpu["kernel_mode"], "fused_base_residual_swiglu_super_tile")
+                self.assertLess(gpu["base_h2d_bytes"], cpu["base_h2d_bytes"])
+                self.assertGreater(gpu["base_resident_bytes"], 0)
+                cpu_runner.close()
+                gpu_runner.close()
 
 
 if __name__ == "__main__":
