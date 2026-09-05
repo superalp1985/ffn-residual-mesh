@@ -163,7 +163,28 @@ effective_compute_density = useful_GPU_ops / transferred_byte
 
 只要 `T_base + T_transport` 能隐藏在 GPU 分支后面，额外的 base 计算就不会增加关键路径；即使 FLOPs 增加，也可能换来更低的 GPU 等待和更高的持续算子利用率。
 
-## 6. 手机和平板 worker
+## 6. 为什么旧手机集群以前不划算
+
+如果每个推理 step 都在设备之间搬运完整层权重，通信量大致随层参数量增长：
+
+```text
+T_full_layer_transfer ∝ number_of_weights / link_bandwidth
+```
+
+手机越多，只是把同一批大权重拆成更多等待队列。设备的计算能力没有真正转化成中心 GPU 的有效工作。
+
+残差方案把数据流改成：
+
+```text
+冷启动：完整权重 -> base artifact + residual artifact
+运行时：descriptor + active tile -> worker/GPU 并行计算 -> 合并
+```
+
+于是完整层权重不再按 step 重复搬运，通信从“模型大小问题”变成“tile 调度问题”。这正是旧手机、旧平板重新有价值的原因：它们提供内存和计算，中心 GPU 只接收 residual、完成合并和非线性。
+
+这不是声称任何网络都足够快。若精确 base 输出本身仍然很大，就需要 10GbE、高吞吐 USB 或更紧凑的 exact artifact；但它已经避开了最浪费带宽的完整层权重搬运路径。
+
+## 7. 手机和平板 worker
 
 worker 不需要替代 GPU，也不需要保存完整模型。它只保存编译后的 base artifact，并按输出行或 tile 分片：
 
@@ -184,7 +205,7 @@ T_critical = max(T_gpu, T_phone)
 
 worker 超时、checksum 失败、温度过高或误差预算不满足时，直接回退中心 GPU 精确 FFN。这样集群是可选后端，不会破坏原有 ComfyUI 工作流。
 
-## 7. 应用前景
+## 8. 应用前景
 
 ### MiniMax H3 + ComfyUI
 
@@ -206,7 +227,7 @@ SwiGLU/down：GPU 计算
 
 旧手机、平板、迷你主机和 NAS 可以作为分布式 base worker。它们贡献的是内存容量、串行/向量计算和并行设备数量；中心 GPU 仍负责最适合 GPU 的 residual 和非线性算子。
 
-## 8. 精确与近似的边界
+## 9. 精确与近似的边界
 
 精确路径：
 

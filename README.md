@@ -30,6 +30,19 @@ FFN Residual Mesh makes this an explicit resource exchange:
 
 The algorithm does not claim to create free compute. It moves work to the place where that work is cheaper: regular residual arithmetic stays on CUDA, while repetitive FFN base information is expanded ahead of time and kept outside the most expensive bandwidth path.
 
+## Why Earlier Phone-Cluster Attempts Stalled
+
+The old approach was usually: split a model layer across phones, then move large weight shards or full-layer tensors for every inference step. That makes network traffic scale with model size, so a phone pool spends its time transferring weights instead of computing.
+
+FFN Residual Mesh changes the traffic pattern:
+
+```text
+cold start:  scan full FFN weights once -> compile resident base artifacts
+runtime:    exchange descriptors + tiles -> compute residuals -> merge on GPU
+```
+
+The model weights are not re-sent as a dense layer on every step. The link carries only the active descriptor, base/residual tile, scale and protocol metadata. This turns a model-size transfer problem into a tile scheduling problem. It does not make bandwidth infinite: exact MiniMax H3 gate/up return is still large enough to require 10GbE, high-throughput USB, or a more compact exact artifact. The important change is that full-layer weight movement is no longer the default path.
+
 ## What We Claim
 
 - A layered FFN split/merge algorithm that can be exact in the selected integer/quantized domain.
