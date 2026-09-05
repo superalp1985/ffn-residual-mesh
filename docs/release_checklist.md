@@ -45,8 +45,7 @@ python scripts/simulate_phone_ffn_cluster.py
 ## 建议 tag
 
 ~~~text
-v0.1.0-rc1
+v0.1.0-rc3
 ~~~
 
 该 tag 表示“公开数学原理、实验脚本和已知边界”，不表示生产就绪。
-
