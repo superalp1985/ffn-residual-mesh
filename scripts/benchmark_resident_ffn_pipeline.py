@@ -39,6 +39,7 @@ def run_resident_ffn(layer_artifact: Path, *, repeats: int = 9, seed: int = 2026
         layer = int(artifact.manifest["layer"])
         rng = np.random.default_rng(seed)
         runner = ResidentGateUp(artifact)
+        resident_weight_upload_before = int(runner.traffic["weight_upload_bytes"])
         inputs = rng.standard_normal((repeats + 1, runner.cols)).astype(np.float32)
         reader = GGUFReader(source)
         try:
@@ -78,6 +79,33 @@ def run_resident_ffn(layer_artifact: Path, *, repeats: int = 9, seed: int = 2026
             key: float(np.median([sample[key] for sample in samples]))
             for key in samples[0]
         }
+        dynamic_h2d_breakdown = {
+            "activation_bytes_per_run": runner.cols * 4,
+            "base_result_bytes_per_run": runner.rows * 2 * 4,
+        }
+        dynamic_h2d_bytes = sum(dynamic_h2d_breakdown.values())
+        timeline_samples = []
+        for sample in samples:
+            active_stage_ms = (
+                sample["activation_h2d_ms"]
+                + sample["residual_stream_span_ms"]
+                + sample["base_h2d_ms"]
+                + sample["merge_stream_span_ms"]
+                + sample["down_stream_span_ms"]
+            )
+            timeline_samples.append({
+                "active_stage_ms": active_stage_ms,
+                "event_gap_ms": max(
+                    0.0,
+                    sample["stream_span_ms"] - active_stage_ms,
+                ),
+                "cpu_base_overlap_proxy_ms": min(
+                    sample["cpu_base_ms"], sample["residual_stream_span_ms"]
+                ),
+            })
+        measured_weight_h2d_delta = int(
+            runner.traffic["weight_upload_bytes"] - resident_weight_upload_before
+        )
         return {
             "status": "measured_single_layer_full_ffn",
             "layer": layer,
@@ -87,7 +115,8 @@ def run_resident_ffn(layer_artifact: Path, *, repeats: int = 9, seed: int = 2026
             "resident_residual_kernel_ms": median["residual_stream_span_ms"],
             "swiglu_down_ms": median["merge_stream_span_ms"] + median["down_stream_span_ms"],
             "critical_ms": median["wall_ms"],
-            "dynamic_h2d_bytes": 4 * (runner.cols + 2 * runner.rows),
+            "dynamic_h2d_bytes": dynamic_h2d_bytes,
+            "dynamic_h2d_breakdown": dynamic_h2d_breakdown,
             "resident_payload_bytes": runner.resident_bytes + down.raw.numel()
                                       + (down.kvalues.numel() * 4 if hasattr(down, "kvalues") else 0),
             "resident_vram_peak_bytes": torch.cuda.max_memory_allocated(),
@@ -95,6 +124,24 @@ def run_resident_ffn(layer_artifact: Path, *, repeats: int = 9, seed: int = 2026
             "cuda_peak_reserved_bytes": torch.cuda.max_memory_reserved(),
             "vram_note": "allocator process peak; reserved is not whole-device usage",
             "residual_weight_h2d_bytes_per_token": 0,
+            "residual_weight_h2d_bytes_measured_delta": measured_weight_h2d_delta,
+            "gpu_timeline": {
+                "stream_span_ms": median["stream_span_ms"],
+                "active_stage_ms": float(np.median([
+                    item["active_stage_ms"] for item in timeline_samples
+                ])),
+                "event_gap_ms": float(np.median([
+                    item["event_gap_ms"] for item in timeline_samples
+                ])),
+                "exposed_cpu_submission_gap_ms": median["exposed_cpu_submission_gap_ms"],
+                "cpu_base_overlap_proxy_ms": float(np.median([
+                    item["cpu_base_overlap_proxy_ms"] for item in timeline_samples
+                ])),
+                "note": (
+                    "CUDA event accounting for this one stream. It is not an "
+                    "SM occupancy, DMA-engine, or end-to-end token-rate metric."
+                ),
+            },
             "timing": median,
             "samples": samples,
             "down_quant_type": quant.name,

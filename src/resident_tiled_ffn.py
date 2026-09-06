@@ -28,6 +28,7 @@ class TiledResidentGateUp:
         use_cuda_graph: bool = False,
         block_rows: int = 2,
         num_warps: int = 2,
+        pipeline_depth: int = 3,
         device: str | torch.device = "cuda",
     ) -> None:
         if not torch.cuda.is_available():
@@ -36,10 +37,13 @@ class TiledResidentGateUp:
         self.device = torch.device(device)
         self.base_on_gpu = bool(base_on_gpu)
         self.use_cuda_graph = bool(use_cuda_graph)
+        self._persistent = bool(persistent)
         if block_rows not in (1, 2, 4, 8):
             raise ValueError("block_rows must be one of 1, 2, 4, 8")
         if num_warps not in (2, 4, 8):
             raise ValueError("num_warps must be 2, 4, or 8")
+        if pipeline_depth < 1:
+            raise ValueError("pipeline_depth must be positive")
         self.block_rows = int(block_rows)
         self.num_warps = int(num_warps)
         self.rows = int(artifact.projections["gate"]["rows"])
@@ -60,16 +64,20 @@ class TiledResidentGateUp:
             cols=self.cols,
             alpha_cols=self.cols // 32,
         )
+        # Keep three transient tiles available so copy and compute can run as
+        # a producer/consumer ring. Persistent layers do not need staging.
+        self._pipeline_depth = int(pipeline_depth) if not self._persistent else 0
+        staging_slots = max(2, self._pipeline_depth)
         self.cache = ResidentTileCache(
             arrays,
             plan=self.plan,
             vram_budget_bytes=(
                 self.plan.total_bytes(cols=self.cols, alpha_cols=self.cols // 32)
-                if persistent else tile_bytes * 2
+                if self._persistent else tile_bytes * staging_slots
             ),
             device=self.device,
         )
-        if persistent:
+        if self._persistent:
             self.cache.cache.initialize_persistent(
                 list(range(len(self.plan.tile_slices())))
             )
@@ -279,8 +287,38 @@ class TiledResidentGateUp:
             tile_events.append((begin_event, end_event))
             self.cache.release(tile)
         else:
-            for tile, (start, stop) in enumerate(self.plan.tile_slices()):
-                self.cache.acquire(tile)
+            tile_ranges = self.plan.tile_slices()
+            pipelined = len(tile_ranges) > 1 and self._pipeline_depth > 0
+            pending_done: dict[int, torch.cuda.Event] = {}
+
+            def retire_tile(tile_index: int) -> None:
+                """Release a tile only after its compute event is complete."""
+                done = pending_done.pop(tile_index, None)
+                if done is not None and not done.query():
+                    done.synchronize()
+                # Finalize the copy ticket before dropping the device tensor.
+                # This also clears a published async ticket; otherwise a
+                # later run could observe a stale ticket without its payload.
+                try:
+                    self.cache.wait_prefetch(tile_index)
+                except RuntimeError:
+                    pass
+                if tile_index in self.cache.device_layers():
+                    self.cache.release(tile_index)
+                    self.cache.evict(tile_index)
+
+            if pipelined:
+                for tile_index in range(min(self._pipeline_depth, len(tile_ranges))):
+                    self.cache.prefetch_async([tile_index])
+
+            for tile, (start, stop) in enumerate(tile_ranges):
+                if pipelined:
+                    if tile not in self.cache.device_layers():
+                        if tile not in self.cache.pending_layers():
+                            self.cache.prefetch_async([tile])
+                        self.cache.wait_prefetch(tile, stream=self.stream)
+                else:
+                    self.cache.acquire(tile)
                 package = self.cache.package(tile)
                 begin_event = torch.cuda.Event(enable_timing=True)
                 end_event = torch.cuda.Event(enable_timing=True)
@@ -293,15 +331,27 @@ class TiledResidentGateUp:
                         package["up.alpha"],
                         self.device_x,
                         self.residual["gate"][start:stop],
-                self.residual["up"][start:stop],
-                rows=stop - start,
-                cols=self.cols,
-                block_rows=self.block_rows,
-                num_warps=self.num_warps,
+                        self.residual["up"][start:stop],
+                        rows=stop - start,
+                        cols=self.cols,
+                        block_rows=self.block_rows,
+                        num_warps=self.num_warps,
                     )
                     end_event.record()
                 tile_events.append((begin_event, end_event))
-                self.cache.release(tile)
+                if pipelined:
+                    pending_done[tile] = end_event
+                    retire_index = tile - self._pipeline_depth + 1
+                    if retire_index >= 0:
+                        retire_tile(retire_index)
+                    next_tile = tile + 1
+                    if (
+                        tile >= self._pipeline_depth - 1
+                        and next_tile < len(tile_ranges)
+                    ):
+                        self.cache.prefetch_async([next_tile])
+                else:
+                    self.cache.release(tile)
             with torch.cuda.stream(self.stream):
                 residual_end.record()
 
@@ -340,6 +390,9 @@ class TiledResidentGateUp:
         # the current stream at dispatch time). Synchronize the device so its
         # completion event is valid before reading timings or outputs.
         torch.cuda.synchronize(self.device)
+        if not full_gpu_fused and "pipelined" in locals() and pipelined:
+            for tile_index in list(pending_done):
+                retire_tile(tile_index)
         wall_ms = (time.perf_counter() - begin) * 1000
         tile_kernel_ms = float(sum(start.elapsed_time(end) for start, end in tile_events))
         result = {

@@ -50,6 +50,42 @@ class ResidentCudaTests(unittest.TestCase):
                 expected = dequantize(raw, GGMLQuantizationType.Q4_K).astype(np.float64) @ x
                 np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
 
+    def test_q4k_k_tiling_matches_reference_for_multiple_chunk_sizes(self):
+        import torch
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA device unavailable")
+        from gguf import GGMLQuantizationType
+        from gguf.quants import dequantize
+        from resident_residual_cuda import DirectQ4Projection
+
+        rng = np.random.default_rng(553)
+        raw = rng.integers(0, 256, (23, 288), dtype=np.uint8)
+        raw[:, 0:2] = np.array([0.002], dtype="<f2").view(np.uint8)
+        raw[:, 2:4] = np.array([0.001], dtype="<f2").view(np.uint8)
+        raw[:, 144:146] = np.array([0.003], dtype="<f2").view(np.uint8)
+        raw[:, 146:148] = np.array([0.0015], dtype="<f2").view(np.uint8)
+        x = rng.standard_normal(512).astype(np.float32)
+        expected = dequantize(raw, GGMLQuantizationType.Q4_K).astype(np.float64) @ x
+        device_x = torch.from_numpy(x).cuda()
+        for chunk_cols in (256, 512):
+            projection = DirectQ4Projection(
+                raw, 512, chunk_cols=chunk_cols
+            )
+            projection.launch(device_x)
+            np.testing.assert_allclose(
+                projection.output.cpu().numpy(),
+                expected,
+                rtol=1e-5,
+                atol=1e-5,
+            )
+
+    def test_q4k_rejects_invalid_chunk_before_gpu_upload(self):
+        from resident_residual_cuda import DirectQ4Projection
+
+        raw = np.zeros((1, 144), dtype=np.uint8)
+        with self.assertRaisesRegex(ValueError, "positive multiple of 256"):
+            DirectQ4Projection(raw, 256, chunk_cols=128)
+
     def test_residuals_upload_once_and_new_inputs_recompute_base_and_swiglu(self):
         import torch
         if not torch.cuda.is_available():

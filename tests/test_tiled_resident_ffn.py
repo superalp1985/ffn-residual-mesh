@@ -64,6 +64,50 @@ class TiledResidentFfnTests(unittest.TestCase):
                 self.assertEqual(result["resident_weight_h2d_bytes"], 0)
                 self.assertGreater(result["weight_h2d_bytes"], 0)
 
+    def test_nonresident_pipeline_depths_preserve_output_and_reap_async_tiles(self) -> None:
+        import torch
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA unavailable")
+        from tests.gguf_fixture import write_fixture
+        from compile_resident_residual_artifact import compile_layer
+        from resident_residual_format import ResidentArtifact
+        from resident_tiled_ffn import TiledResidentGateUp
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_fixture(root / "fixture.gguf")
+            compile_layer(root / "fixture.gguf", 0, 4, root / "artifact")
+            with ResidentArtifact.open(root / "artifact") as artifact:
+                for depth in (1, 2, 3):
+                    with self.subTest(pipeline_depth=depth):
+                        runner = TiledResidentGateUp(
+                            artifact,
+                            tile_rows=64,
+                            pipeline_depth=depth,
+                        )
+                        x = np.random.default_rng(565 + depth).standard_normal(
+                            runner.cols
+                        ).astype(np.float32)
+                        expected_gate = (
+                            artifact.reconstruct_weights("gate").astype(np.float64) @ x
+                        )
+                        expected_up = (
+                            artifact.reconstruct_weights("up").astype(np.float64) @ x
+                        )
+                        first = runner.run(x)
+                        second = runner.run(x)
+                        np.testing.assert_allclose(
+                            second["gate"], expected_gate, rtol=1e-4, atol=1e-4
+                        )
+                        np.testing.assert_allclose(
+                            second["up"], expected_up, rtol=1e-4, atol=1e-4
+                        )
+                        self.assertGreater(second["weight_h2d_bytes"],
+                                           first["weight_h2d_bytes"])
+                        self.assertEqual(runner.cache.pending_layers(), [])
+                        self.assertEqual(runner.cache.device_layers(), [])
+                        runner.close()
+
     def test_persistent_tiles_have_zero_weight_h2d_after_cold_start(self) -> None:
         import torch
         if not torch.cuda.is_available():

@@ -36,6 +36,69 @@ def _direct_q4k(raw, x, output, ROWS: tl.constexpr, COLS: tl.constexpr,
 
 
 @triton.jit
+def _fused_q4k(
+    raw,
+    x,
+    output,
+    ROWS: tl.constexpr,
+    COLS: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    BLOCK_COLS: tl.constexpr,
+):
+    """K-tiled Q4_K GEMV with the accumulator kept in registers.
+
+    The legacy path used one 32768-lane vector for a 17408-wide projection.
+    That shape is correct but creates an unnecessarily large register/live
+    range for batch-1 decode.  K tiling preserves the exact Q4_K decode and
+    reduction order while giving the scheduler bounded programs.
+    """
+    row = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    row_mask = row < ROWS
+    acc = tl.zeros((BLOCK_ROWS,), dtype=tl.float32)
+    for col_start in range(0, COLS, BLOCK_COLS):
+        col = col_start + tl.arange(0, BLOCK_COLS)
+        col_mask = col < COLS
+        mask = row_mask[:, None] & col_mask[None, :]
+        block = raw + row[:, None] * (COLS // 256 * 144) + col[None, :] // 256 * 144
+        d_bits = (
+            tl.load(block, mask, other=0).to(tl.uint32)
+            | (tl.load(block + 1, mask, other=0).to(tl.uint32) << 8)
+        )
+        m_bits = (
+            tl.load(block + 2, mask, other=0).to(tl.uint32)
+            | (tl.load(block + 3, mask, other=0).to(tl.uint32) << 8)
+        )
+        d = tl.cast(d_bits.to(tl.uint16), tl.float16, bitcast=True).to(tl.float32)
+        dm = tl.cast(m_bits.to(tl.uint16), tl.float16, bitcast=True).to(tl.float32)
+        group = (col[None, :] % 256) // 32
+        low_scale = tl.load(
+            block + 4 + group % 4, mask, other=0
+        ).to(tl.int32)
+        low_min = tl.load(
+            block + 8 + group % 4, mask, other=0
+        ).to(tl.int32)
+        mix = tl.load(
+            block + 12 + group % 4, mask, other=0
+        ).to(tl.int32)
+        scale = tl.where(
+            group < 4, low_scale & 63, (mix & 15) | ((low_scale >> 2) & 48)
+        )
+        minimum = tl.where(
+            group < 4, low_min & 63, (mix >> 4) | ((low_min >> 2) & 48)
+        )
+        packed = tl.load(
+            block + 16 + (col[None, :] % 256) // 64 * 32 + col[None, :] % 32,
+            mask,
+            other=0,
+        ).to(tl.int32)
+        q = (packed >> ((group % 2) * 4)) & 15
+        weight = (d * scale.to(tl.float32)) * q.to(tl.float32) - dm * minimum.to(tl.float32)
+        activation = tl.load(x + col, col_mask, other=0)
+        acc += tl.sum(weight * activation[None, :], axis=1)
+    tl.store(output + row, acc, row_mask)
+
+
+@triton.jit
 def _direct_iq4nl(raw, x, partial, kvalues, ROWS: tl.constexpr, COLS: tl.constexpr,
                   CHUNKS: tl.constexpr, CHUNK_COLS: tl.constexpr,
                   BLOCK_ROWS: tl.constexpr, BLOCK_COLS: tl.constexpr):
@@ -95,25 +158,36 @@ def _fused_iq4nl(raw, x, output, kvalues, ROWS: tl.constexpr, COLS: tl.constexpr
 
 
 class DirectQ4Projection:
-    def __init__(self, raw: np.ndarray, cols: int, *, block_rows: int = 1, num_warps: int = 4):
+    def __init__(
+        self,
+        raw: np.ndarray,
+        cols: int,
+        *,
+        block_rows: int = 2,
+        num_warps: int = 2,
+        chunk_cols: int = 512,
+    ):
         if raw.dtype != np.uint8 or raw.ndim != 2 or cols % 256 or raw.shape[1] != cols // 256 * 144:
             raise ValueError("expected row-major raw Q4_K tensor")
+        if chunk_cols <= 0 or chunk_cols % 256:
+            raise ValueError("chunk_cols must be a positive multiple of 256")
         self.raw = torch.from_numpy(np.array(raw, copy=True)).cuda()
         self.rows, self.cols = raw.shape[0], cols
         self.block_rows, self.num_warps = block_rows, num_warps
+        self.chunk_cols = min(int(chunk_cols), cols)
         self.output = torch.empty(self.rows, device="cuda")
 
     def launch(self, device_x: torch.Tensor) -> None:
-        _direct_q4k[(triton.cdiv(self.rows, self.block_rows),)](
+        _fused_q4k[(triton.cdiv(self.rows, self.block_rows),)](
             self.raw, device_x, self.output, ROWS=self.rows, COLS=self.cols,
-            BLOCK_ROWS=self.block_rows, BLOCK_COLS=triton.next_power_of_2(self.cols),
+            BLOCK_ROWS=self.block_rows, BLOCK_COLS=triton.next_power_of_2(self.chunk_cols),
             num_warps=self.num_warps, enable_fp_fusion=False,
         )
 
 
 class DirectIQ4NLProjection:
     def __init__(self, raw: np.ndarray, cols: int, *, chunk_cols: int = 1024,
-                 block_rows: int = 2, num_warps: int = 4):
+                 block_rows: int = 1, num_warps: int = 1):
         if raw.dtype != np.uint8 or raw.ndim != 2 or cols % 32 or raw.shape[1] != cols // 32 * 18:
             raise ValueError("expected row-major raw IQ4_NL tensor")
         self.raw = torch.from_numpy(np.array(raw, copy=True)).cuda()

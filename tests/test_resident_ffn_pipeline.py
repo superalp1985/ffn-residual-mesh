@@ -33,6 +33,15 @@ class ResidentFullFfnTests(unittest.TestCase):
                                     report["resident_payload_bytes"])
             self.assertEqual(report["dynamic_h2d_bytes"], 3072)
             self.assertEqual(report["residual_weight_h2d_bytes_per_token"], 0)
+            self.assertEqual(report["residual_weight_h2d_bytes_measured_delta"], 0)
+            self.assertEqual(
+                report["dynamic_h2d_breakdown"]["activation_bytes_per_run"], 1024
+            )
+            self.assertEqual(
+                report["dynamic_h2d_breakdown"]["base_result_bytes_per_run"], 2048
+            )
+            self.assertGreaterEqual(report["gpu_timeline"]["stream_span_ms"], 0.0)
+            self.assertGreaterEqual(report["gpu_timeline"]["event_gap_ms"], 0.0)
             self.assertEqual(len(report["samples"]), 3)
 
     def test_down_receives_merged_swiglu_and_reports_no_weight_uploads(self):
