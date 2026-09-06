@@ -41,14 +41,15 @@ class ResidentCudaTests(unittest.TestCase):
         from resident_residual_cuda import DirectQ4Projection
         with tempfile.TemporaryDirectory() as directory:
             raw = write_fixture(Path(directory) / "fixture.gguf")["gate"]
-            baseline = DirectQ4Projection(raw, 256)
-            for seed in (51, 52):
-                x = np.random.default_rng(seed).standard_normal(256).astype(np.float32)
-                device_x = torch.from_numpy(x).cuda()
-                baseline.launch(device_x)
-                actual = baseline.output.cpu().numpy()
-                expected = dequantize(raw, GGMLQuantizationType.Q4_K).astype(np.float64) @ x
-                np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
+            for kernel, block_qblocks in (("legacy", 1), ("grouped", 1), ("grouped", 2)):
+                baseline = DirectQ4Projection(raw, 256, kernel=kernel, block_qblocks=block_qblocks)
+                for seed in (51, 52):
+                    x = np.random.default_rng(seed).standard_normal(256).astype(np.float32)
+                    device_x = torch.from_numpy(x).cuda()
+                    baseline.launch(device_x)
+                    actual = baseline.output.cpu().numpy()
+                    expected = dequantize(raw, GGMLQuantizationType.Q4_K).astype(np.float64) @ x
+                    np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)
 
     def test_q4k_k_tiling_matches_reference_for_multiple_chunk_sizes(self):
         import torch
@@ -67,17 +68,22 @@ class ResidentCudaTests(unittest.TestCase):
         x = rng.standard_normal(512).astype(np.float32)
         expected = dequantize(raw, GGMLQuantizationType.Q4_K).astype(np.float64) @ x
         device_x = torch.from_numpy(x).cuda()
-        for chunk_cols in (256, 512):
-            projection = DirectQ4Projection(
-                raw, 512, chunk_cols=chunk_cols
-            )
-            projection.launch(device_x)
-            np.testing.assert_allclose(
-                projection.output.cpu().numpy(),
-                expected,
-                rtol=1e-5,
-                atol=1e-5,
-            )
+        for kernel, block_qblocks in (("legacy", 1), ("grouped", 1), ("grouped", 2)):
+            for chunk_cols in (256, 512):
+                projection = DirectQ4Projection(
+                    raw,
+                    512,
+                    chunk_cols=chunk_cols,
+                    kernel=kernel,
+                    block_qblocks=block_qblocks,
+                )
+                projection.launch(device_x)
+                np.testing.assert_allclose(
+                    projection.output.cpu().numpy(),
+                    expected,
+                    rtol=1e-5,
+                    atol=1e-5,
+                )
 
     def test_q4k_rejects_invalid_chunk_before_gpu_upload(self):
         from resident_residual_cuda import DirectQ4Projection
@@ -99,24 +105,36 @@ class ResidentCudaTests(unittest.TestCase):
             write_fixture(root / "fixture.gguf")
             compile_layer(root / "fixture.gguf", 0, 4, root / "artifact")
             with ResidentArtifact.open(root / "artifact") as artifact:
-                runner = ResidentGateUp(artifact, block_rows=1, num_warps=4)
-                initial = dict(runner.traffic)
-                for seed in (7, 17):
-                    x = np.random.default_rng(seed).standard_normal(256).astype(np.float32)
-                    result = runner.run(x)
-                    expected = {p: artifact.reconstruct_weights(p).astype(np.float64) @ x
-                                for p in ("gate", "up")}
-                    for p in ("gate", "up"):
-                        np.testing.assert_allclose(result[p], expected[p], atol=1e-5, rtol=1e-5)
-                    swiglu = expected["gate"] / (1 + np.exp(-expected["gate"])) * expected["up"]
-                    np.testing.assert_allclose(result["swiglu"], swiglu, atol=1e-4, rtol=1e-5)
-                self.assertEqual(runner.traffic["weight_upload_bytes"], initial["weight_upload_bytes"])
-                self.assertEqual(runner.traffic["dynamic_h2d_bytes"], 2 * (256 + 512) * 4)
-                self.assertEqual(runner.resident_bytes, artifact.gate_up_bytes())
-                self.assertEqual(runner.traffic["weight_h2d_bytes_per_run"], 0)
-                self.assertEqual(len(runner.kernel_resources), 2)
-                self.assertIn("registers_per_thread", runner.kernel_resources[0])
-                self.assertIn("spills", runner.kernel_resources[0])
+                for residual_kernel, block_rows in (
+                    ("legacy", 1),
+                    ("grouped", 1),
+                    ("grouped", 8),
+                    ("grouped_fused", 8),
+                ):
+                    runner = ResidentGateUp(
+                        artifact,
+                        block_rows=block_rows,
+                        num_warps=4,
+                        residual_kernel=residual_kernel,
+                    )
+                    initial = dict(runner.traffic)
+                    for seed in (7, 17):
+                        x = np.random.default_rng(seed).standard_normal(256).astype(np.float32)
+                        result = runner.run(x)
+                        expected = {p: artifact.reconstruct_weights(p).astype(np.float64) @ x
+                                    for p in ("gate", "up")}
+                        for p in ("gate", "up"):
+                            np.testing.assert_allclose(result[p], expected[p], atol=1e-5, rtol=1e-5)
+                        swiglu = expected["gate"] / (1 + np.exp(-expected["gate"])) * expected["up"]
+                        np.testing.assert_allclose(result["swiglu"], swiglu, atol=1e-4, rtol=1e-5)
+                    self.assertEqual(runner.traffic["weight_upload_bytes"], initial["weight_upload_bytes"])
+                    self.assertEqual(runner.traffic["dynamic_h2d_bytes"], 2 * (256 + 512) * 4)
+                    self.assertEqual(runner.resident_bytes, artifact.gate_up_bytes())
+                    self.assertEqual(runner.traffic["weight_h2d_bytes_per_run"], 0)
+                    expected_kernel_count = 1 if residual_kernel == "grouped_fused" else 2
+                    self.assertEqual(len(runner.kernel_resources), expected_kernel_count)
+                    self.assertIn("registers_per_thread", runner.kernel_resources[0])
+                    self.assertIn("spills", runner.kernel_resources[0])
 
 
 if __name__ == "__main__":

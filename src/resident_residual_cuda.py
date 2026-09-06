@@ -99,6 +99,110 @@ def _fused_q4k(
 
 
 @triton.jit
+def _fused_q4k_grouped(
+    raw,
+    x,
+    output,
+    ROWS: tl.constexpr,
+    COLS: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    BLOCK_QBLOCKS: tl.constexpr,
+):
+    """Q4_K GEMV that decodes each packed Q4_K block only once per CTA tile."""
+    row = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    row_mask = row < ROWS
+    qblock_lane = tl.arange(0, BLOCK_QBLOCKS)
+    byte = tl.arange(0, 32)
+    qblocks = COLS // 256
+    row_bytes = qblocks * 144
+    acc = tl.zeros((BLOCK_ROWS,), dtype=tl.float32)
+
+    for qblock_start in range(0, qblocks, BLOCK_QBLOCKS):
+        qblock = qblock_start + qblock_lane
+        qblock_mask = qblock < qblocks
+        block = raw + row[:, None] * row_bytes + qblock[None, :] * 144
+        header_mask = row_mask[:, None] & qblock_mask[None, :]
+        d_bits = (
+            tl.load(block, header_mask, other=0).to(tl.uint32)
+            | (tl.load(block + 1, header_mask, other=0).to(tl.uint32) << 8)
+        )
+        m_bits = (
+            tl.load(block + 2, header_mask, other=0).to(tl.uint32)
+            | (tl.load(block + 3, header_mask, other=0).to(tl.uint32) << 8)
+        )
+        d = tl.cast(d_bits.to(tl.uint16), tl.float16, bitcast=True).to(tl.float32)
+        dm = tl.cast(m_bits.to(tl.uint16), tl.float16, bitcast=True).to(tl.float32)
+
+        for pair in range(0, 4):
+            first_group = pair * 2
+            second_group = first_group + 1
+            first_index = first_group % 4
+            second_index = second_group % 4
+            first_scale_low = tl.load(block + 4 + first_index, header_mask, other=0).to(tl.int32)
+            first_min_low = tl.load(block + 8 + first_index, header_mask, other=0).to(tl.int32)
+            first_mix = tl.load(block + 12 + first_index, header_mask, other=0).to(tl.int32)
+            second_scale_low = tl.load(block + 4 + second_index, header_mask, other=0).to(tl.int32)
+            second_min_low = tl.load(block + 8 + second_index, header_mask, other=0).to(tl.int32)
+            second_mix = tl.load(block + 12 + second_index, header_mask, other=0).to(tl.int32)
+            first_scale = tl.where(
+                first_group < 4,
+                first_scale_low & 63,
+                (first_mix & 15) | ((first_scale_low >> 2) & 48),
+            )
+            first_minimum = tl.where(
+                first_group < 4,
+                first_min_low & 63,
+                (first_mix >> 4) | ((first_min_low >> 2) & 48),
+            )
+            second_scale = tl.where(
+                second_group < 4,
+                second_scale_low & 63,
+                (second_mix & 15) | ((second_scale_low >> 2) & 48),
+            )
+            second_minimum = tl.where(
+                second_group < 4,
+                second_min_low & 63,
+                (second_mix >> 4) | ((second_min_low >> 2) & 48),
+            )
+            value_mask = header_mask[:, :, None]
+            packed = tl.load(
+                block[:, :, None] + 16 + pair * 32 + byte[None, None, :],
+                value_mask,
+                other=0,
+            ).to(tl.int32)
+            first_q = packed & 15
+            second_q = (packed >> 4) & 15
+            activation_offset = qblock[:, None] * 256 + pair * 64 + byte[None, :]
+            first_x = tl.load(
+                x + activation_offset,
+                mask=qblock_mask[:, None],
+                other=0.0,
+            )
+            second_x = tl.load(
+                x + activation_offset + 32,
+                mask=qblock_mask[:, None],
+                other=0.0,
+            )
+            first_weight = (
+                d[:, :, None] * first_scale[:, :, None].to(tl.float32)
+                * first_q.to(tl.float32)
+                - dm[:, :, None] * first_minimum[:, :, None].to(tl.float32)
+            )
+            second_weight = (
+                d[:, :, None] * second_scale[:, :, None].to(tl.float32)
+                * second_q.to(tl.float32)
+                - dm[:, :, None] * second_minimum[:, :, None].to(tl.float32)
+            )
+            block_dot = tl.sum(
+                first_weight * first_x[None, :, :]
+                + second_weight * second_x[None, :, :],
+                axis=2,
+            )
+            acc += tl.sum(block_dot, axis=1)
+    tl.store(output + row, acc, row_mask)
+
+
+@triton.jit
 def _direct_iq4nl(raw, x, partial, kvalues, ROWS: tl.constexpr, COLS: tl.constexpr,
                   CHUNKS: tl.constexpr, CHUNK_COLS: tl.constexpr,
                   BLOCK_ROWS: tl.constexpr, BLOCK_COLS: tl.constexpr):
@@ -166,18 +270,32 @@ class DirectQ4Projection:
         block_rows: int = 2,
         num_warps: int = 2,
         chunk_cols: int = 512,
+        kernel: str = "legacy",
+        block_qblocks: int = 1,
     ):
         if raw.dtype != np.uint8 or raw.ndim != 2 or cols % 256 or raw.shape[1] != cols // 256 * 144:
             raise ValueError("expected row-major raw Q4_K tensor")
         if chunk_cols <= 0 or chunk_cols % 256:
             raise ValueError("chunk_cols must be a positive multiple of 256")
+        if kernel not in ("legacy", "grouped"):
+            raise ValueError("unsupported Q4_K kernel")
+        if block_qblocks not in (1, 2, 4):
+            raise ValueError("block_qblocks must be 1, 2, or 4")
         self.raw = torch.from_numpy(np.array(raw, copy=True)).cuda()
         self.rows, self.cols = raw.shape[0], cols
         self.block_rows, self.num_warps = block_rows, num_warps
         self.chunk_cols = min(int(chunk_cols), cols)
+        self.kernel, self.block_qblocks = kernel, block_qblocks
         self.output = torch.empty(self.rows, device="cuda")
 
     def launch(self, device_x: torch.Tensor) -> None:
+        if self.kernel == "grouped":
+            _fused_q4k_grouped[(triton.cdiv(self.rows, self.block_rows),)](
+                self.raw, device_x, self.output, ROWS=self.rows, COLS=self.cols,
+                BLOCK_ROWS=self.block_rows, BLOCK_QBLOCKS=self.block_qblocks,
+                num_warps=self.num_warps, enable_fp_fusion=False,
+            )
+            return
         _fused_q4k[(triton.cdiv(self.rows, self.block_rows),)](
             self.raw, device_x, self.output, ROWS=self.rows, COLS=self.cols,
             BLOCK_ROWS=self.block_rows, BLOCK_COLS=triton.next_power_of_2(self.chunk_cols),
@@ -233,6 +351,197 @@ def _residual_dot(packed, alpha, x, output, ROWS: tl.constexpr, COLS: tl.constex
     activation = tl.load(x + col, col < COLS, other=0)
     dot = tl.sum(r * scale * activation[None, :], axis=1)
     tl.store(output + row, dot, row < ROWS)
+
+
+@triton.jit
+def _residual_dot_grouped(
+    packed, alpha, x, output,
+    ROWS: tl.constexpr, COLS: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr, BLOCK_GROUPS: tl.constexpr,
+):
+    """Decode one 32-code group from each packed 16-byte segment.
+
+    This is intentionally a separate candidate from ``_residual_dot``.  The
+    grouped layout loads the group scale once, loads every packed byte once,
+    and accumulates the low/high nibbles together before moving to the next
+    group tile.
+    """
+    row = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    row_mask = row < ROWS
+    group_lane = tl.arange(0, BLOCK_GROUPS)
+    byte = tl.arange(0, 16)
+    groups = COLS // 32
+    accum = tl.zeros((BLOCK_ROWS,), dtype=tl.float32)
+
+    for group_start in range(0, groups, BLOCK_GROUPS):
+        group = group_start + group_lane
+        group_mask = group < groups
+        mask = row_mask[:, None, None] & group_mask[None, :, None]
+        packed_offset = (
+            row[:, None, None] * (COLS // 2)
+            + group[None, :, None] * 16
+            + byte[None, None, :]
+        )
+        value = tl.load(packed + packed_offset, mask=mask, other=0).to(tl.int32)
+        low = value & 15
+        high = (value >> 4) & 15
+        low = tl.where(low >= 8, low - 16, low).to(tl.float32)
+        high = tl.where(high >= 8, high - 16, high).to(tl.float32)
+        scale = tl.load(
+            alpha + row[:, None] * groups + group[None, :],
+            mask=row_mask[:, None] & group_mask[None, :],
+            other=0.0,
+        )
+        low_x = tl.load(
+            x + group[:, None] * 32 + byte[None, :] * 2,
+            mask=group_mask[:, None],
+            other=0.0,
+        )
+        high_x = tl.load(
+            x + group[:, None] * 32 + byte[None, :] * 2 + 1,
+            mask=group_mask[:, None],
+            other=0.0,
+        )
+        group_dot = tl.sum(
+            (low * low_x[None, :, :] + high * high_x[None, :, :])
+            * scale[:, :, None],
+            axis=2,
+        )
+        accum += tl.sum(group_dot, axis=1)
+
+    tl.store(output + row, accum, row_mask)
+
+
+@triton.jit
+def _fused_gate_up_residual_grouped(
+    gate_packed, gate_alpha, up_packed, up_alpha, x,
+    gate_output, up_output,
+    ROWS: tl.constexpr, COLS: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr, BLOCK_GROUPS: tl.constexpr,
+):
+    """Grouped gate/up residual GEMV sharing one activation decode per CTA."""
+    row = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    row_mask = row < ROWS
+    group_lane = tl.arange(0, BLOCK_GROUPS)
+    byte = tl.arange(0, 16)
+    groups = COLS // 32
+    gate_accum = tl.zeros((BLOCK_ROWS,), dtype=tl.float32)
+    up_accum = tl.zeros((BLOCK_ROWS,), dtype=tl.float32)
+
+    for group_start in range(0, groups, BLOCK_GROUPS):
+        group = group_start + group_lane
+        group_mask = group < groups
+        mask = row_mask[:, None, None] & group_mask[None, :, None]
+        packed_offset = (
+            row[:, None, None] * (COLS // 2)
+            + group[None, :, None] * 16
+            + byte[None, None, :]
+        )
+        low_x = tl.load(
+            x + group[:, None] * 32 + byte[None, :] * 2,
+            mask=group_mask[:, None],
+            other=0.0,
+        )
+        high_x = tl.load(
+            x + group[:, None] * 32 + byte[None, :] * 2 + 1,
+            mask=group_mask[:, None],
+            other=0.0,
+        )
+
+        gate_value = tl.load(
+            gate_packed + packed_offset, mask=mask, other=0
+        ).to(tl.int32)
+        gate_low = gate_value & 15
+        gate_high = (gate_value >> 4) & 15
+        gate_low = tl.where(gate_low >= 8, gate_low - 16, gate_low).to(tl.float32)
+        gate_high = tl.where(gate_high >= 8, gate_high - 16, gate_high).to(tl.float32)
+        gate_scale = tl.load(
+            gate_alpha + row[:, None] * groups + group[None, :],
+            mask=row_mask[:, None] & group_mask[None, :],
+            other=0.0,
+        )
+        gate_dot = tl.sum(
+            (gate_low * low_x[None, :, :] + gate_high * high_x[None, :, :])
+            * gate_scale[:, :, None],
+            axis=2,
+        )
+        gate_accum += tl.sum(gate_dot, axis=1)
+
+        up_value = tl.load(
+            up_packed + packed_offset, mask=mask, other=0
+        ).to(tl.int32)
+        up_low = up_value & 15
+        up_high = (up_value >> 4) & 15
+        up_low = tl.where(up_low >= 8, up_low - 16, up_low).to(tl.float32)
+        up_high = tl.where(up_high >= 8, up_high - 16, up_high).to(tl.float32)
+        up_scale = tl.load(
+            up_alpha + row[:, None] * groups + group[None, :],
+            mask=row_mask[:, None] & group_mask[None, :],
+            other=0.0,
+        )
+        up_dot = tl.sum(
+            (up_low * low_x[None, :, :] + up_high * high_x[None, :, :])
+            * up_scale[:, :, None],
+            axis=2,
+        )
+        up_accum += tl.sum(up_dot, axis=1)
+
+    tl.store(gate_output + row, gate_accum, row_mask)
+    tl.store(up_output + row, up_accum, row_mask)
+
+
+def _launch_residual_dot(
+    packed: torch.Tensor,
+    alpha: torch.Tensor,
+    device_x: torch.Tensor,
+    output: torch.Tensor,
+    *,
+    rows: int,
+    cols: int,
+    block_rows: int,
+    num_warps: int,
+    kernel: str,
+    block_groups: int = 32,
+) -> object:
+    if kernel == "legacy":
+        return _residual_dot[(triton.cdiv(rows, block_rows),)](
+            packed, alpha, device_x, output,
+            ROWS=rows, COLS=cols,
+            BLOCK_ROWS=block_rows, BLOCK_COLS=triton.next_power_of_2(cols),
+            num_warps=num_warps, enable_fp_fusion=False,
+        )
+    if kernel == "grouped":
+        return _residual_dot_grouped[(triton.cdiv(rows, block_rows),)](
+            packed, alpha, device_x, output,
+            ROWS=rows, COLS=cols,
+            BLOCK_ROWS=block_rows, BLOCK_GROUPS=block_groups,
+            num_warps=num_warps, enable_fp_fusion=False,
+        )
+    raise ValueError(f"unsupported residual kernel: {kernel}")
+
+
+def _launch_fused_gate_up_residual_grouped(
+    gate_packed: torch.Tensor,
+    gate_alpha: torch.Tensor,
+    up_packed: torch.Tensor,
+    up_alpha: torch.Tensor,
+    device_x: torch.Tensor,
+    gate_output: torch.Tensor,
+    up_output: torch.Tensor,
+    *,
+    rows: int,
+    cols: int,
+    block_rows: int,
+    num_warps: int,
+    block_groups: int,
+) -> object:
+    return _fused_gate_up_residual_grouped[(triton.cdiv(rows, block_rows),)](
+        gate_packed, gate_alpha, up_packed, up_alpha, device_x,
+        gate_output, up_output,
+        ROWS=rows, COLS=cols,
+        BLOCK_ROWS=block_rows, BLOCK_GROUPS=block_groups,
+        num_warps=num_warps, enable_fp_fusion=False,
+    )
 
 
 @triton.jit
@@ -463,6 +772,8 @@ def launch_residual_tile(
     cols: int,
     block_rows: int = 1,
     num_warps: int = 4,
+    kernel: str = "legacy",
+    block_groups: int = 32,
 ) -> None:
     """Launch the resident residual dot for one independently transferred tile."""
     if packed.device.type != "cuda" or alpha.device.type != "cuda":
@@ -477,11 +788,11 @@ def launch_residual_tile(
         raise ValueError("alpha shape does not match tile dimensions")
     if device_x.numel() != cols or output.numel() != rows:
         raise ValueError("activation/output shape does not match tile dimensions")
-    _residual_dot[(triton.cdiv(rows, block_rows),)](
+    _launch_residual_dot(
         packed, alpha, device_x, output,
-        ROWS=rows, COLS=cols,
-        BLOCK_ROWS=block_rows, BLOCK_COLS=triton.next_power_of_2(cols),
-        num_warps=num_warps, enable_fp_fusion=False,
+        rows=rows, cols=cols,
+        block_rows=block_rows, num_warps=num_warps, kernel=kernel,
+        block_groups=block_groups,
     )
 
 
@@ -658,9 +969,21 @@ def _merge_swiglu(gate_r, up_r, gate_base, up_base, gate, up, output,
 class ResidentGateUp:
     """Single-flight gate/up probe. Down and layer paging are deliberately outside its scope."""
 
-    def __init__(self, artifact: ResidentArtifact, *, block_rows: int = 1, num_warps: int = 4):
+    def __init__(
+        self,
+        artifact: ResidentArtifact,
+        *,
+        block_rows: int = 1,
+        num_warps: int = 4,
+        residual_kernel: str = "legacy",
+        residual_block_groups: int = 32,
+    ):
         if block_rows not in (1, 2, 4, 8) or num_warps not in (4, 8):
             raise ValueError("invalid kernel launch configuration")
+        if residual_kernel not in ("legacy", "grouped", "grouped_fused"):
+            raise ValueError("invalid residual kernel")
+        if residual_block_groups not in (8, 16, 32, 64, 128):
+            raise ValueError("invalid residual block group count")
         if not all(p in artifact.projections for p in ("gate", "up")):
             raise ValueError("both gate and up must have compiled Q4_K projections")
         self.rows = artifact.projections["gate"]["rows"]
@@ -669,6 +992,8 @@ class ResidentGateUp:
                for p in ("gate", "up")):
             raise ValueError("gate/up dimensions differ")
         self.block_rows, self.num_warps = block_rows, num_warps
+        self.residual_kernel = residual_kernel
+        self.residual_block_groups = residual_block_groups
         self.stream = torch.cuda.Stream()
         self.host_x = torch.empty(self.cols, dtype=torch.float32, pin_memory=True)
         self.host_base = {p: torch.empty(self.rows, dtype=torch.float32, pin_memory=True) for p in ("gate", "up")}
@@ -698,15 +1023,33 @@ class ResidentGateUp:
 
     def launch_residuals(self) -> None:
         resources = []
-        for p in ("gate", "up"):
-            kernel = _residual_dot[(triton.cdiv(self.rows, self.block_rows),)](
-                self.weights[p]["residual"], self.weights[p]["alpha"], self.device_x,
-                self.residual[p], ROWS=self.rows, COLS=self.cols,
-                BLOCK_ROWS=self.block_rows, BLOCK_COLS=triton.next_power_of_2(self.cols),
-                num_warps=self.num_warps, enable_fp_fusion=False,
+        if self.residual_kernel == "grouped_fused":
+            compiled = _launch_fused_gate_up_residual_grouped(
+                self.weights["gate"]["residual"], self.weights["gate"]["alpha"],
+                self.weights["up"]["residual"], self.weights["up"]["alpha"],
+                self.device_x, self.residual["gate"], self.residual["up"],
+                rows=self.rows, cols=self.cols,
+                block_rows=self.block_rows, num_warps=self.num_warps,
+                block_groups=self.residual_block_groups,
             )
-            resources.append({"projection": p, "registers_per_thread": kernel.n_regs,
-                              "spills": kernel.n_spills, "shared_bytes": kernel.metadata.shared})
+            self.kernel_resources = [{
+                "projection": "gate_up_fused",
+                "registers_per_thread": compiled.n_regs,
+                "spills": compiled.n_spills,
+                "shared_bytes": compiled.metadata.shared,
+            }]
+            return
+        for p in ("gate", "up"):
+            compiled = _launch_residual_dot(
+                self.weights[p]["residual"], self.weights[p]["alpha"], self.device_x,
+                self.residual[p],
+                rows=self.rows, cols=self.cols,
+                block_rows=self.block_rows, num_warps=self.num_warps,
+                kernel=self.residual_kernel,
+                block_groups=self.residual_block_groups,
+            )
+            resources.append({"projection": p, "registers_per_thread": compiled.n_regs,
+                              "spills": compiled.n_spills, "shared_bytes": compiled.metadata.shared})
         self.kernel_resources = resources
 
     def run(self, x: np.ndarray, *, return_outputs: bool = True, down=None) -> dict:

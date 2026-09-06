@@ -25,7 +25,12 @@ class ResidentFullFfnTests(unittest.TestCase):
             root = Path(directory)
             write_fixture(root / "fixture.gguf", quantized_down=True)
             compile_layer(root / "fixture.gguf", 0, 4, root / "artifact")
-            report = run_resident_ffn(root / "artifact", repeats=3, cpu_threads=1)
+            report = run_resident_ffn(
+                root / "artifact",
+                repeats=3,
+                cpu_threads=1,
+                warmup_seconds=0.0,
+            )
             self.assertLess(report["output_rel_l2"], 1e-5)
             self.assertEqual(report["quality_scope"], "synthetic_inputs_not_model_quality")
             self.assertIsNone(report["tokens_per_second"])
@@ -42,6 +47,8 @@ class ResidentFullFfnTests(unittest.TestCase):
             )
             self.assertGreaterEqual(report["gpu_timeline"]["stream_span_ms"], 0.0)
             self.assertGreaterEqual(report["gpu_timeline"]["event_gap_ms"], 0.0)
+            self.assertEqual(report["warmup_seconds_requested"], 0.0)
+            self.assertEqual(report["warmup_runs"], 0)
             self.assertEqual(len(report["samples"]), 3)
 
     def test_down_receives_merged_swiglu_and_reports_no_weight_uploads(self):
@@ -74,6 +81,33 @@ class ResidentFullFfnTests(unittest.TestCase):
                 np.testing.assert_allclose(result["down"], expected, atol=1e-4, rtol=2e-5)
                 self.assertGreater(result["timing"]["down_stream_span_ms"], 0)
                 self.assertEqual(result["dynamic_h2d_bytes"], 3072)
+
+    def test_full_ffn_uses_grouped_q4k_down_configuration(self):
+        import torch
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA unavailable")
+        from tests.gguf_fixture import write_fixture
+        from compile_resident_residual_artifact import compile_layer
+        from benchmark_resident_ffn_pipeline import run_resident_ffn
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_fixture(root / "fixture.gguf", q4k_down=True)
+            compile_layer(root / "fixture.gguf", 0, 4, root / "artifact")
+            report = run_resident_ffn(
+                root / "artifact",
+                repeats=3,
+                cpu_threads=1,
+                down_kernel="grouped",
+                down_block_rows=2,
+                down_num_warps=2,
+                down_block_qblocks=4,
+            )
+            self.assertEqual(report["down_quant_type"], "Q4_K")
+            self.assertEqual(report["down_kernel"], "grouped")
+            self.assertEqual(report["down_kernel_config"]["block_rows"], 2)
+            self.assertEqual(report["down_kernel_config"]["num_warps"], 2)
+            self.assertEqual(report["down_kernel_config"]["block_qblocks"], 4)
+            self.assertLess(report["output_rel_l2"], 1e-5)
 
 
 if __name__ == "__main__":

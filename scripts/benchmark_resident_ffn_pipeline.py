@@ -26,9 +26,16 @@ def reference_dot(tensor, x):
 
 
 def run_resident_ffn(layer_artifact: Path, *, repeats: int = 9, seed: int = 20260905,
-                     cpu_threads: int = 8) -> dict:
-    if repeats < 3 or cpu_threads < 1:
-        raise ValueError("at least 3 repeats and a positive CPU thread count required")
+                     cpu_threads: int = 8, residual_kernel: str = "legacy",
+                     block_rows: int = 1, num_warps: int = 4,
+                     residual_block_groups: int = 32, down_kernel: str = "legacy",
+                     down_block_rows: int = 2, down_num_warps: int = 2,
+                     down_chunk_cols: int = 512, down_block_qblocks: int = 1,
+                     warmup_seconds: float = 0.5) -> dict:
+    if repeats < 3 or cpu_threads < 1 or warmup_seconds < 0:
+        raise ValueError(
+            "at least 3 repeats, a positive CPU thread count, and nonnegative warmup required"
+        )
     torch.cuda.reset_peak_memory_stats()
     with ResidentArtifact.open(layer_artifact, verify_hashes=True) as artifact:
         source = Path(artifact.manifest["source"]["path"])
@@ -38,7 +45,13 @@ def run_resident_ffn(layer_artifact: Path, *, repeats: int = 9, seed: int = 2026
             raise ValueError("source GGUF changed after compilation")
         layer = int(artifact.manifest["layer"])
         rng = np.random.default_rng(seed)
-        runner = ResidentGateUp(artifact)
+        runner = ResidentGateUp(
+            artifact,
+            block_rows=block_rows,
+            num_warps=num_warps,
+            residual_kernel=residual_kernel,
+            residual_block_groups=residual_block_groups,
+        )
         resident_weight_upload_before = int(runner.traffic["weight_upload_bytes"])
         inputs = rng.standard_normal((repeats + 1, runner.cols)).astype(np.float32)
         reader = GGUFReader(source)
@@ -49,7 +62,15 @@ def run_resident_ffn(layer_artifact: Path, *, repeats: int = 9, seed: int = 2026
             if quant is GGMLQuantizationType.IQ4_NL:
                 down = DirectIQ4NLProjection(tensor.data, int(tensor.shape[0]))
             elif quant is GGMLQuantizationType.Q4_K:
-                down = DirectQ4Projection(tensor.data, int(tensor.shape[0]))
+                down = DirectQ4Projection(
+                    tensor.data,
+                    int(tensor.shape[0]),
+                    block_rows=down_block_rows,
+                    num_warps=down_num_warps,
+                    chunk_cols=down_chunk_cols,
+                    kernel=down_kernel,
+                    block_qblocks=down_block_qblocks,
+                )
             else:
                 raise ValueError(f"unsupported down tensor in v1 pipeline: {quant.name}")
             with threadpool_limits(limits=cpu_threads):
@@ -64,9 +85,11 @@ def run_resident_ffn(layer_artifact: Path, *, repeats: int = 9, seed: int = 2026
         samples = []
         with threadpool_limits(limits=cpu_threads):
             # Compile kernels and raise clocks before timing.
-            warm_until = time.perf_counter() + 0.5
+            warmup_runs = 0
+            warm_until = time.perf_counter() + warmup_seconds
             while time.perf_counter() < warm_until:
                 runner.run(inputs[0], down=down, return_outputs=False)
+                warmup_runs += 1
             result = runner.run(inputs[0], down=down)
             delta = result["down"].astype(np.float64) - reference
             rel_l2 = float(np.linalg.norm(delta) / max(float(np.linalg.norm(reference)), 1e-20))
@@ -111,6 +134,19 @@ def run_resident_ffn(layer_artifact: Path, *, repeats: int = 9, seed: int = 2026
             "layer": layer,
             "dimensions": {"hidden": runner.cols, "ffn": runner.rows},
             "merge_order": "gate_up_before_swiglu",
+            "residual_kernel": residual_kernel,
+            "residual_kernel_config": {
+                "block_rows": block_rows,
+                "num_warps": num_warps,
+                "block_groups": residual_block_groups,
+            },
+            "down_kernel": getattr(down, "kernel", "iq4_nl_fused"),
+            "down_kernel_config": {
+                "block_rows": getattr(down, "block_rows", None),
+                "num_warps": getattr(down, "num_warps", None),
+                "chunk_cols": getattr(down, "chunk_cols", None),
+                "block_qblocks": getattr(down, "block_qblocks", None),
+            },
             "cpu_base_ms": median["cpu_base_ms"],
             "resident_residual_kernel_ms": median["residual_stream_span_ms"],
             "swiglu_down_ms": median["merge_stream_span_ms"] + median["down_stream_span_ms"],
@@ -144,6 +180,8 @@ def run_resident_ffn(layer_artifact: Path, *, repeats: int = 9, seed: int = 2026
             },
             "timing": median,
             "samples": samples,
+            "warmup_seconds_requested": warmup_seconds,
+            "warmup_runs": warmup_runs,
             "down_quant_type": quant.name,
             "output_rel_l2": rel_l2, "output_max_abs": float(np.abs(delta).max()),
             "quality_scope": "synthetic_inputs_not_model_quality",
@@ -162,9 +200,37 @@ def main() -> None:
     parser.add_argument("artifact", type=Path)
     parser.add_argument("--repeats", type=int, default=9)
     parser.add_argument("--cpu-threads", type=int, default=8)
+    parser.add_argument(
+        "--residual-kernel",
+        choices=("legacy", "grouped", "grouped_fused"),
+        default="legacy",
+    )
+    parser.add_argument("--block-rows", type=int, choices=(1, 2, 4, 8), default=1)
+    parser.add_argument("--num-warps", type=int, choices=(4, 8), default=4)
+    parser.add_argument("--block-groups", type=int, choices=(8, 16, 32, 64, 128), default=32)
+    parser.add_argument("--down-kernel", choices=("legacy", "grouped"), default="legacy")
+    parser.add_argument("--down-block-rows", type=int, choices=(1, 2, 4, 8), default=2)
+    parser.add_argument("--down-num-warps", type=int, choices=(2, 4, 8), default=2)
+    parser.add_argument("--down-chunk-cols", type=int, choices=(256, 512, 1024, 2048), default=512)
+    parser.add_argument("--down-block-qblocks", type=int, choices=(1, 2, 4), default=1)
+    parser.add_argument("--warmup-seconds", type=float, default=0.5)
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
-    report = run_resident_ffn(args.artifact, repeats=args.repeats, cpu_threads=args.cpu_threads)
+    report = run_resident_ffn(
+        args.artifact,
+        repeats=args.repeats,
+        cpu_threads=args.cpu_threads,
+        residual_kernel=args.residual_kernel,
+        block_rows=args.block_rows,
+        num_warps=args.num_warps,
+        residual_block_groups=args.block_groups,
+        down_kernel=args.down_kernel,
+        down_block_rows=args.down_block_rows,
+        down_num_warps=args.down_num_warps,
+        down_chunk_cols=args.down_chunk_cols,
+        down_block_qblocks=args.down_block_qblocks,
+        warmup_seconds=args.warmup_seconds,
+    )
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(json.dumps(report, indent=2))

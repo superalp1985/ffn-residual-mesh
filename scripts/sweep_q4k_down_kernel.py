@@ -49,6 +49,8 @@ def measure(
     block_rows: int,
     num_warps: int,
     chunk_cols: int,
+    kernel: str,
+    block_qblocks: int,
     warmup: int,
     repeats: int,
     activation: torch.Tensor,
@@ -59,6 +61,8 @@ def measure(
         block_rows=block_rows,
         num_warps=num_warps,
         chunk_cols=chunk_cols,
+        kernel=kernel,
+        block_qblocks=block_qblocks,
     )
     try:
         for _ in range(warmup):
@@ -77,6 +81,8 @@ def measure(
             "block_rows": block_rows,
             "num_warps": num_warps,
             "chunk_cols": chunk_cols,
+            "kernel": kernel,
+            "block_qblocks": block_qblocks,
             "gpu_ms_median": float(np.median(values)),
             "gpu_ms_p95": float(np.percentile(values, 95)),
             "samples_ms": values,
@@ -99,19 +105,23 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     for block_rows in parse_int_list(args.block_rows):
         for num_warps in parse_int_list(args.num_warps):
             for chunk_cols in parse_int_list(args.chunk_cols):
-                configurations.append(
-                    measure(
-                        raw,
-                        cols,
-                        rows,
-                        block_rows=block_rows,
-                        num_warps=num_warps,
-                        chunk_cols=chunk_cols,
-                        warmup=args.warmup,
-                        repeats=args.repeats,
-                        activation=activation,
-                    )
-                )
+                for kernel in args.kernel.split(","):
+                    for block_qblocks in parse_int_list(args.block_qblocks):
+                        configurations.append(
+                            measure(
+                                raw,
+                                cols,
+                                rows,
+                                block_rows=block_rows,
+                                num_warps=num_warps,
+                                chunk_cols=chunk_cols,
+                                kernel=kernel,
+                                block_qblocks=block_qblocks,
+                                warmup=args.warmup,
+                                repeats=args.repeats,
+                                activation=activation,
+                            )
+                        )
     configurations.sort(key=lambda item: item["gpu_ms_median"])
     return {
         "status": "q4k_down_kernel_shape_sweep",
@@ -138,6 +148,8 @@ def main() -> None:
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--layer", type=int, required=True)
     parser.add_argument("--chunk-cols", default="256,512,1024,2048")
+    parser.add_argument("--kernel", default="legacy,grouped")
+    parser.add_argument("--block-qblocks", default="1,2,4")
     parser.add_argument("--block-rows", default="1,2,4")
     parser.add_argument("--num-warps", default="2,4,8")
     parser.add_argument("--warmup", type=int, default=3)
