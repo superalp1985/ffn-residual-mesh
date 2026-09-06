@@ -73,7 +73,7 @@ def compile_layer(
             "base": ("|u1", [rows, cols // 32]),
             "alpha": ("<f4", [rows, cols // 32]),
             "beta": ("<f4", [rows, cols // 32]),
-            "coefficient": ("<f8", [rows, cols // 32]),
+            "coefficient": ("<f4", [rows, cols // 32]),
         }
         files = {}
         mismatch_count = 0
@@ -92,7 +92,7 @@ def compile_layer(
                     raise ValueError("internal error: exact signed nibble overflow")
                 nibble = (residual & 15).astype(np.uint8)
                 packed = nibble[:, 0::2] | (nibble[:, 1::2] << 4)
-                coefficients = alpha.astype(np.float64) * base + beta.astype(np.float64)
+                coefficients = alpha * base.astype(np.float32) + beta
                 reconstructed = (alpha[:, :, None] * groups.astype(np.float32)
                                  + beta[:, :, None]).reshape(q.shape)
                 oracle = dequantize(raw, tensor.tensor_type)

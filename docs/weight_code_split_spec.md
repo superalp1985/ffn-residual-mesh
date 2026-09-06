@@ -34,6 +34,12 @@ host artifact contains the pre-expanded coefficient `a*c + beta`. `beta` and
 the original base descriptors are retained for verification and future
 repacking. No runtime lookup table is required.
 
+New artifacts store this host coefficient as contiguous FP32. This halves its
+host-RAM footprint and permits an in-place FP32 GEMV into the pinned base
+buffer. It changes only floating-point reduction precision, not the integer
+code split or residual representation. The reader accepts legacy FP64
+coefficient payloads and converts them to FP32 once at runner cold start.
+
 The byte ledger must report these separately:
 
 ```text

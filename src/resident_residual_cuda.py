@@ -672,7 +672,11 @@ class ResidentGateUp:
         self.stream = torch.cuda.Stream()
         self.host_x = torch.empty(self.cols, dtype=torch.float32, pin_memory=True)
         self.host_base = {p: torch.empty(self.rows, dtype=torch.float32, pin_memory=True) for p in ("gate", "up")}
-        self.coefficient = {p: artifact.arrays[p]["coefficient"] for p in ("gate", "up")}
+        self.group_sums = np.empty(self.cols // 32, dtype=np.float32)
+        self.coefficient = {
+            p: np.array(artifact.arrays[p]["coefficient"], dtype=np.float32, order="C", copy=True)
+            for p in ("gate", "up")
+        }
         self.device_x = torch.empty(self.cols, dtype=torch.float32, device="cuda")
         self.weights = {}
         self.base, self.residual, self.output = {}, {}, {}
@@ -722,9 +726,9 @@ class ResidentGateUp:
             self.launch_residuals()
             e2.record()
         cpu_begin = time.perf_counter()
-        sums = values.astype(np.float64).reshape(-1, 32).sum(axis=1)
+        np.sum(values.reshape(-1, 32), axis=1, dtype=np.float32, out=self.group_sums)
         for p in ("gate", "up"):
-            self.host_base[p].numpy()[:] = self.coefficient[p] @ sums
+            np.matmul(self.coefficient[p], self.group_sums, out=self.host_base[p].numpy())
         cpu_ms = (time.perf_counter() - cpu_begin) * 1000
         with torch.cuda.stream(self.stream):
             e3.record()

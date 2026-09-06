@@ -17,7 +17,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 sys.path.insert(0, str(ROOT / "src"))
 
 from compile_resident_residual_artifact import compile_layer  # noqa: E402
-from resident_residual_format import ResidentArtifact  # noqa: E402
+from resident_residual_format import ResidentArtifact, file_sha256  # noqa: E402
 from tests.gguf_fixture import write_fixture  # noqa: E402
 
 
@@ -45,6 +45,7 @@ class ResidentResidualArtifactTests(unittest.TestCase):
                 self.assertEqual(artifact.fallbacks["down"]["type_name"], "F32")
                 rng = np.random.default_rng(42)
                 for projection in ("gate", "up"):
+                    self.assertEqual(artifact.arrays[projection]["coefficient"].dtype, np.dtype("<f4"))
                     expected = dequantize(raw[projection], GGMLQuantizationType.Q4_K)
                     actual = artifact.reconstruct_weights(projection)
                     np.testing.assert_array_equal(actual, expected)
@@ -64,6 +65,36 @@ class ResidentResidualArtifactTests(unittest.TestCase):
                 self.assertEqual(ledger["resident_gate_up_bytes"], 2 * (256 * 128 + 256 * 8 * 4))
                 self.assertEqual(ledger["residual_code_bytes"], 256 * 256)
                 self.assertGreater(ledger["host_base_bytes"], 0)
+
+    def test_reader_accepts_legacy_fp64_coefficient_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "fixture.gguf"
+            write_fixture(source)
+            result = compile_layer(source, layer=0, bits=4, out_dir=root / "artifact")
+            manifest_path = Path(result["path"])
+            manifest = json.loads(manifest_path.read_text())
+            with ResidentArtifact.open(root / "artifact") as compiled:
+                legacy_coefficients = {
+                    projection: (
+                        np.asarray(compiled.arrays[projection]["alpha"], dtype=np.float64)
+                        * np.asarray(compiled.arrays[projection]["base"], dtype=np.float64)
+                        + np.asarray(compiled.arrays[projection]["beta"], dtype=np.float64)
+                    )
+                    for projection in ("gate", "up")
+                }
+            for projection in ("gate", "up"):
+                entry = manifest["projections"][projection]["files"]["coefficient"]
+                payload = root / "artifact" / entry["file"]
+                legacy_coefficients[projection].astype("<f8").tofile(payload)
+                entry["dtype"] = "<f8"
+                entry["bytes"] = payload.stat().st_size
+                entry["sha256"] = file_sha256(payload)
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            with ResidentArtifact.open(manifest_path, verify_hashes=True) as artifact:
+                for projection in ("gate", "up"):
+                    self.assertEqual(artifact.arrays[projection]["coefficient"].dtype, np.dtype("<f8"))
+                    self.assertTrue(np.isfinite(artifact.arrays[projection]["coefficient"]).all())
 
     def test_corrupt_payload_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

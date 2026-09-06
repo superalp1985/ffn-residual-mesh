@@ -41,7 +41,6 @@ class ResidentArtifact:
                     "base": ([rows, cols // 32], "|u1"),
                     "alpha": ([rows, cols // 32], "<f4"),
                     "beta": ([rows, cols // 32], "<f4"),
-                    "coefficient": ([rows, cols // 32], "<f8"),
                 }
                 if rows <= 0 or cols <= 0 or cols % 256:
                     raise ValueError("invalid projection dimensions")
@@ -59,6 +58,27 @@ class ResidentArtifact:
                     if verify_hashes and file_sha256(target) != entry["sha256"]:
                         raise ValueError(f"SHA256 mismatch: {target}")
                     result.arrays[name][kind] = np.memmap(target, mode="r", dtype=dtype, shape=tuple(shape))
+                coefficient = projection["files"]["coefficient"]
+                coefficient_dtype = np.dtype(coefficient["dtype"])
+                if coefficient_dtype not in (np.dtype("<f4"), np.dtype("<f8")):
+                    raise ValueError("coefficient payload must be FP32 or legacy FP64")
+                coefficient_shape = [rows, cols // 32]
+                coefficient_target = (result.directory / coefficient["file"]).resolve()
+                if coefficient_target.parent != result.directory:
+                    raise ValueError("artifact payload escapes directory")
+                coefficient_size = int(np.prod(coefficient_shape)) * coefficient_dtype.itemsize
+                if (coefficient["shape"] != coefficient_shape
+                        or coefficient["bytes"] != coefficient_size
+                        or coefficient_target.stat().st_size != coefficient_size):
+                    raise ValueError(f"invalid payload descriptor: {coefficient_target}")
+                if verify_hashes and file_sha256(coefficient_target) != coefficient["sha256"]:
+                    raise ValueError(f"SHA256 mismatch: {coefficient_target}")
+                result.arrays[name]["coefficient"] = np.memmap(
+                    coefficient_target,
+                    mode="r",
+                    dtype=coefficient_dtype,
+                    shape=tuple(coefficient_shape),
+                )
         except Exception:
             result.close()
             raise
