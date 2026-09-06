@@ -1,0 +1,42 @@
+{
+  "status": "measured_two_layer_gpu_resident_device_chain",
+  "layers": [
+    3,
+    21
+  ],
+  "warmup": 12,
+  "repeats": 15,
+  "host_sync_chain_wall_ms_median": 3.633699961937964,
+  "host_sync_chain_wall_ms_p95": 3.907380031887442,
+  "host_sync_chain_gpu_ms_median": 3.6013760566711426,
+  "host_sync_chain_gpu_ms_p95": 3.882303977012634,
+  "tail_sync_chain_wall_ms_median": 3.431800054386258,
+  "tail_sync_chain_wall_ms_p95": 3.5464400774799287,
+  "tail_sync_chain_gpu_ms_median": 3.373055934906006,
+  "tail_sync_chain_gpu_ms_p95": 3.4783679723739622,
+  "async_chain_gpu_ms_median": 3.3666560649871826,
+  "async_chain_gpu_ms_p95": 3.542163276672363,
+  "async_cpu_enqueue_ms_median": 0.3856000257655978,
+  "activation_h2d_bytes_per_layer": [
+    0,
+    0
+  ],
+  "activation_d2d_bytes_per_layer": [
+    0,
+    0
+  ],
+  "base_h2d_bytes_per_layer": [
+    0,
+    0
+  ],
+  "resident_weight_h2d_bytes_per_layer": [
+    0,
+    0
+  ],
+  "first_kernel_mode": "device_activation_fused_base_residual_swiglu",
+  "second_kernel_mode": "device_activation_fused_base_residual_swiglu",
+  "device": "NVIDIA GeForce RTX 4070 Laptop GPU",
+  "torch": "2.9.1+cu130",
+  "cuda": "13.0",
+  "note": "Host-sync, tail-sync and explicit async modes are measured separately. All device paths use zero H2D activation/base traffic; this is not end-to-end generation."
+}

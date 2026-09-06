@@ -55,6 +55,45 @@ def _direct_iq4nl(raw, x, partial, kvalues, ROWS: tl.constexpr, COLS: tl.constex
     tl.store(partial + row * CHUNKS + chunk, dot, row < ROWS)
 
 
+@triton.jit
+def _fused_iq4nl(raw, x, output, kvalues, ROWS: tl.constexpr, COLS: tl.constexpr,
+                 BLOCK_ROWS: tl.constexpr, BLOCK_COLS: tl.constexpr):
+    """Single-kernel IQ4_NL GEMV with bounded K tiles.
+
+    The old path emitted one kernel per K chunk and a second torch reduction
+    over the partial matrix.  Keeping the accumulator in registers removes the
+    intermediate partial write/read and the extra launch boundary while
+    preserving the original IQ4_NL decode.
+    """
+    row = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    row_mask = row < ROWS
+    acc = tl.zeros((BLOCK_ROWS,), dtype=tl.float32)
+    for col_start in range(0, COLS, BLOCK_COLS):
+        local = tl.arange(0, BLOCK_COLS)
+        col = col_start + local
+        mask = row_mask[:, None] & (col[None, :] < COLS)
+        block = raw + row[:, None] * (COLS // 32 * 18) + col[None, :] // 32 * 18
+        d_bits = (
+            tl.load(block, mask, other=0).to(tl.uint32)
+            | (tl.load(block + 1, mask, other=0).to(tl.uint32) << 8)
+        )
+        d = tl.cast(d_bits.to(tl.uint16), tl.float16, bitcast=True).to(tl.float32)
+        packed = tl.load(
+            block + 2 + col[None, :] % 16,
+            mask,
+            other=0,
+        ).to(tl.int32)
+        q = (packed >> (((col[None, :] % 32) // 16) * 4)) & 15
+        weight = d * tl.load(
+            kvalues + q,
+            q < 16,
+            other=0,
+        ).to(tl.float32)
+        activation = tl.load(x + col, col < COLS, other=0)
+        acc += tl.sum(weight * activation[None, :], axis=1)
+    tl.store(output + row, acc, row_mask)
+
+
 class DirectQ4Projection:
     def __init__(self, raw: np.ndarray, cols: int, *, block_rows: int = 1, num_warps: int = 4):
         if raw.dtype != np.uint8 or raw.ndim != 2 or cols % 256 or raw.shape[1] != cols // 256 * 144:
@@ -73,8 +112,8 @@ class DirectQ4Projection:
 
 
 class DirectIQ4NLProjection:
-    def __init__(self, raw: np.ndarray, cols: int, *, chunk_cols: int = 4096,
-                 block_rows: int = 1, num_warps: int = 4):
+    def __init__(self, raw: np.ndarray, cols: int, *, chunk_cols: int = 1024,
+                 block_rows: int = 2, num_warps: int = 4):
         if raw.dtype != np.uint8 or raw.ndim != 2 or cols % 32 or raw.shape[1] != cols // 32 * 18:
             raise ValueError("expected row-major raw IQ4_NL tensor")
         self.raw = torch.from_numpy(np.array(raw, copy=True)).cuda()
@@ -92,13 +131,19 @@ class DirectIQ4NLProjection:
         self.partial = torch.empty((self.rows, self.chunks), device="cuda")
 
     def launch(self, device_x: torch.Tensor) -> None:
-        _direct_iq4nl[(triton.cdiv(self.rows, self.block_rows), self.chunks)](
-            self.raw, device_x, self.partial, self.kvalues, ROWS=self.rows, COLS=self.cols,
-            CHUNKS=self.chunks, CHUNK_COLS=self.chunk_cols,
-            BLOCK_ROWS=self.block_rows, BLOCK_COLS=triton.next_power_of_2(self.chunk_cols),
-            num_warps=self.num_warps, enable_fp_fusion=False,
+        _fused_iq4nl[(triton.cdiv(self.rows, self.block_rows),)](
+            self.raw,
+            device_x,
+            self.output,
+            self.kvalues,
+            ROWS=self.rows,
+            COLS=self.cols,
+            BLOCK_ROWS=self.block_rows,
+            BLOCK_COLS=triton.next_power_of_2(self.chunk_cols),
+            num_warps=self.num_warps,
+            num_stages=2,
+            enable_fp_fusion=True,
         )
-        torch.sum(self.partial, dim=1, out=self.output)
 
 
 @triton.jit
@@ -257,6 +302,83 @@ def _fused_gate_up_base_residual(
     tl.store(swiglu_output + row, gate * tl.sigmoid(gate) * up, row_mask)
 
 
+@triton.jit
+def _fused_gate_up_base_residual_tiled(
+    gate_packed, gate_alpha, up_packed, up_alpha,
+    gate_coeff, up_coeff, group_sums, x,
+    gate_output, up_output, swiglu_output,
+    ROWS: tl.constexpr, COLS: tl.constexpr, GROUPS: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr, BLOCK_COLS: tl.constexpr,
+    BLOCK_GROUPS: tl.constexpr,
+):
+    """K-tiled super-tile kernel with bounded register footprint.
+
+    The previous super-tile kernel materialized the entire hidden dimension as
+    one Triton vector (8192 lanes for a 5120-wide Qwen layer).  This variant
+    keeps the same exact split/merge arithmetic but reduces the K tile so the
+    scheduler can keep several row programs resident.
+    """
+    row = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    row_mask = row < ROWS
+    gate_acc = tl.zeros((BLOCK_ROWS,), dtype=tl.float32)
+    up_acc = tl.zeros((BLOCK_ROWS,), dtype=tl.float32)
+    for col_start in range(0, COLS, BLOCK_COLS):
+        col = col_start + tl.arange(0, BLOCK_COLS)
+        col_mask = col < COLS
+        mask = row_mask[:, None] & col_mask[None, :]
+        packed_offset = row[:, None] * (COLS // 2) + col[None, :] // 2
+        shift = (col[None, :] % 2) * 4
+
+        gate_value = tl.load(
+            gate_packed + packed_offset, mask=mask, other=0
+        ).to(tl.int32)
+        gate_q = (gate_value >> shift) & 15
+        gate_r = tl.where(gate_q >= 8, gate_q - 16, gate_q).to(tl.float32)
+        gate_scale = tl.load(
+            gate_alpha + row[:, None] * GROUPS + col[None, :] // 32,
+            mask=mask,
+            other=0.0,
+        )
+
+        up_value = tl.load(
+            up_packed + packed_offset, mask=mask, other=0
+        ).to(tl.int32)
+        up_q = (up_value >> shift) & 15
+        up_r = tl.where(up_q >= 8, up_q - 16, up_q).to(tl.float32)
+        up_scale = tl.load(
+            up_alpha + row[:, None] * GROUPS + col[None, :] // 32,
+            mask=mask,
+            other=0.0,
+        )
+
+        activation = tl.load(x + col, mask=col_mask, other=0.0)
+        gate_acc += tl.sum(
+            gate_r * gate_scale * activation[None, :], axis=1
+        )
+        up_acc += tl.sum(
+            up_r * up_scale * activation[None, :], axis=1
+        )
+
+    group = tl.arange(0, BLOCK_GROUPS)
+    group_mask = group < GROUPS
+    sums = tl.load(group_sums + group, mask=group_mask, other=0.0).to(tl.float32)
+    gate_c = tl.load(
+        gate_coeff + row[:, None] * GROUPS + group[None, :],
+        mask=row_mask[:, None] & group_mask[None, :],
+        other=0.0,
+    ).to(tl.float32)
+    up_c = tl.load(
+        up_coeff + row[:, None] * GROUPS + group[None, :],
+        mask=row_mask[:, None] & group_mask[None, :],
+        other=0.0,
+    ).to(tl.float32)
+    gate = gate_acc + tl.sum(gate_c * sums[None, :], axis=1)
+    up = up_acc + tl.sum(up_c * sums[None, :], axis=1)
+    tl.store(gate_output + row, gate, mask=row_mask)
+    tl.store(up_output + row, up, mask=row_mask)
+    tl.store(swiglu_output + row, gate * tl.sigmoid(gate) * up, mask=row_mask)
+
+
 def launch_residual_tile(
     packed: torch.Tensor,
     alpha: torch.Tensor,
@@ -387,6 +509,7 @@ def launch_fused_gate_up_base_residual(
     cols: int,
     block_rows: int = 1,
     num_warps: int = 8,
+    block_cols: int = 512,
 ) -> None:
     tensors = (
         gate_packed, gate_alpha, up_packed, up_alpha,
@@ -408,14 +531,17 @@ def launch_fused_gate_up_base_residual(
         raise ValueError("activation/group shape does not match fused base/residual dimensions")
     if any(tensor.numel() != rows for tensor in (gate_output, up_output, swiglu_output)):
         raise ValueError("output shape does not match fused base/residual dimensions")
-    _fused_gate_up_base_residual[(triton.cdiv(rows, block_rows),)](
+    if block_cols <= 0 or block_cols % 32:
+        raise ValueError("block_cols must be a positive multiple of 32")
+    block_cols = min(int(block_cols), cols)
+    _fused_gate_up_base_residual_tiled[(triton.cdiv(rows, block_rows),)](
         gate_packed, gate_alpha, up_packed, up_alpha,
         gate_coeff, up_coeff, group_sums, device_x,
         gate_output, up_output, swiglu_output,
         ROWS=rows, COLS=cols, GROUPS=groups,
-        BLOCK_ROWS=block_rows, BLOCK_COLS=triton.next_power_of_2(cols),
+        BLOCK_ROWS=block_rows, BLOCK_COLS=block_cols,
         BLOCK_GROUPS=triton.next_power_of_2(groups),
-        num_warps=num_warps, enable_fp_fusion=False,
+        num_warps=num_warps, num_stages=2, enable_fp_fusion=True,
     )
 
 

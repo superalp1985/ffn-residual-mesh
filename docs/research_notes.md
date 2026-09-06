@@ -191,6 +191,30 @@ x*w = Bx*Bw*(x_hi*w_hi)
 3. 分别测无结构高位项、块共享高位项和残差项的静态/动态字节，淘汰“数学等价但没有减少读取”的公式。
 4. 只把通过字节账本的公式接入 GPU SiLU/down 路径。
 
+## 2026-09-06 设备侧链路调研与实现
+
+本轮先核对了 PyTorch CUDA stream/event 与 CUDA Graph 的官方语义，再修改设备
+激活路径。`Stream.wait_event` 适合表达跨 stream 依赖；CUDA Graph 适合固定形状
+工作链的重复提交，但不减少 FFN 算术量。由此得到一个更窄、可验证的优化：
+
+```text
+GPU activation 已经存在
+    -> 同一消费 stream 计算 group_sums
+    -> fused residual + resident base + SwiGLU
+    -> resident down
+    -> 下一层直接消费
+```
+
+对已经在 GPU 上的 activation，额外 D2D copy 或独立 base stream 没有可隐藏的
+H2D 工作，反而会增加 event 依赖。因此 `run_device()` 现在直接使用调用者 tensor，
+并提供 `synchronize=False` 让多层调用在一个 stream 上连续排队。异步模式只返回
+completion event，不允许在 GPU 完成前读取输出。
+
+真实 Qwen3.8-27B layer 3/21 的两层链测得约 17.63 ms GPU span、约 2.77 ms CPU
+enqueue；两层 activation/base 的动态 H2D/D2D 账本均为零。这是减少层间主机往返和
+提交空隙的证据，不是完整模型 token/s 结论。下一阶段应继续减少 Python/event
+开销，并用系统级 profiler 测量 kernel gap，而不是只看单层 wall time。
+
 ## 2026-09-03 资源导向的共享基底扫描
 
 本轮不把共享基底当成必须采用的固定答案，而是把它放入“GPU 计算效率换带宽/显存”的候选集合。对 layer 23 的 gate/up 做了共享右基底与各自右基底的数学扫描，秩为 8、16、32、64、128、256，并对残差做 2/3/4/8-bit 对称分组量化。
@@ -203,6 +227,49 @@ x*w = Bx*Bw*(x_hi*w_hi)
 - 共享基底在 rank=256 比独立基底少约 `1 MiB` fp16 基底/系数静态空间；独立基底残差略小，但差异不足以改变结论。
 
 因此后续不再机械追求“同一个 U”。真正的筛选目标是：共享/独立/分区基底都可选，但残差必须进一步变成短码、位平面、共享模板或其他规则结构；否则只是把一份稠密权重换成另一份稠密权重。
+
+## 2026-09-06 单 kernel IQ4_NL down 与 DMA 边界复核
+
+本轮先复核 CUDA stream/event、异步拷贝和 CUDA Graph 的语义，再处理层内
+人为的串行边界。原 `DirectIQ4NLProjection.launch()` 是：
+
+```text
+多个 K 分块 IQ4_NL kernel -> partial 矩阵写回 -> torch.sum 归约
+```
+
+现在改成 `_fused_iq4nl` 单 kernel：每个 row program 在寄存器中按 K tile
+累加，保留原 IQ4_NL 16-bit half scale 解码，最后一次性写出 output。该改动
+通过真实 IQ4_NL fixture、完整 CUDA 测试和 CUDA Graph down 捕获校验。
+
+真实 Qwen3.8-27B layer 3（RTX 4070 Laptop，PyTorch 2.9.1+cu130）：
+
+```text
+group_sum                         median 0.0225 ms
+fused gate/up/base/residual       median 0.7808 ms
+fused IQ4_NL down                 median 0.4905 ms
+整条 GPU event span                约 1.94 ms（样本受频率抖动影响）
+```
+
+layer 21 的对应中位数为 `0.0192 ms / 0.8457 ms / 0.4905 ms`。因此
+`0.3~0.5 ms` 目前只在单独 down GEMV 上达到，不能代表完整
+`gate + up + SwiGLU + down`。
+
+设备激活两层链的重新测量：
+
+```text
+主机逐层同步 GPU span       median 3.31 ms
+链尾一次同步 GPU span       median 3.14 ms
+显式异步同 stream           median 3.16 ms
+CPU enqueue                 median 0.38 ms
+每层 activation/base H2D    0 B
+```
+
+这组数据不能支持“GPU 没有通过硬件 DMA”的判断：常驻设备路径根本没有运行时
+activation/base H2D，因而没有需要 DMA 的传输。层间仍存在
+`layer N output -> layer N+1 input` 的数学依赖；异步 stream 只能消除主机提交
+等待，不能把依赖的两个 GEMV 重叠。需要进一步突破的是 int4 GEMV 的 kernel
+效率、量化解码与点积融合，以及换入路径的 pinned-memory copy/compute 双缓冲，
+而不是给常驻路径额外添加 D2D 或 event。
 
 ## 2026-09-03 激活敏感度选块
 

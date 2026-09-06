@@ -228,6 +228,159 @@ class TiledResidentFfnTests(unittest.TestCase):
                     self.assertTrue(result["graph_includes_down"])
                 reader.data._mmap.close()
 
+    def test_run_device_consumes_gpu_activation_without_copy(self) -> None:
+        import torch
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA unavailable")
+        from tests.gguf_fixture import write_fixture
+        from compile_resident_residual_artifact import compile_layer
+        from resident_residual_format import ResidentArtifact
+        from resident_tiled_ffn import TiledResidentGateUp
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_fixture(root / "fixture.gguf")
+            compile_layer(root / "fixture.gguf", 0, 4, root / "artifact")
+            with ResidentArtifact.open(root / "artifact") as artifact:
+                with TiledResidentGateUp(
+                    artifact,
+                    tile_rows=256,
+                    persistent=True,
+                    base_on_gpu=True,
+                ) as runner:
+                    x = torch.randn(runner.cols, device="cuda", dtype=torch.float32)
+                    result = runner.run_device(x)
+                    expected_gate = artifact.reconstruct_weights("gate").astype(np.float64) @ x.cpu().numpy()
+                    expected_up = artifact.reconstruct_weights("up").astype(np.float64) @ x.cpu().numpy()
+                    np.testing.assert_allclose(
+                        result["gate"], expected_gate, rtol=2e-4, atol=2e-4
+                    )
+                    np.testing.assert_allclose(
+                        result["up"], expected_up, rtol=2e-4, atol=2e-4
+                    )
+                    self.assertEqual(result["activation_h2d_bytes"], 0)
+                    self.assertEqual(result["activation_d2d_bytes"], 0)
+                    self.assertEqual(result["base_h2d_bytes"], 0)
+                    self.assertEqual(result["activation_source"], "caller_gpu_tensor")
+
+    def test_run_device_can_chain_two_gpu_resident_layers(self) -> None:
+        import torch
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA unavailable")
+        from tests.gguf_fixture import write_fixture
+        from compile_resident_residual_artifact import compile_layer
+        from resident_residual_format import ResidentArtifact
+        from resident_tiled_ffn import TiledResidentGateUp
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_fixture(root / "fixture.gguf")
+            compile_layer(root / "fixture.gguf", 0, 4, root / "artifact")
+            with ResidentArtifact.open(root / "artifact") as artifact:
+                with TiledResidentGateUp(
+                    artifact,
+                    tile_rows=256,
+                    persistent=True,
+                    base_on_gpu=True,
+                ) as first, TiledResidentGateUp(
+                    artifact,
+                    tile_rows=256,
+                    persistent=True,
+                    base_on_gpu=True,
+                ) as second:
+                    stream = torch.cuda.Stream()
+                    x = torch.randn(first.cols, device="cuda", dtype=torch.float32)
+                    with torch.cuda.stream(stream):
+                        first_result = first.run_device(
+                            x, stream=stream, return_outputs=False
+                        )
+                        hidden = first.output["swiglu"]
+                        second_result = second.run_device(
+                            hidden, stream=stream, return_outputs=False
+                        )
+                    stream.synchronize()
+                    hidden_host = hidden.cpu().numpy()
+                    expected_gate = artifact.reconstruct_weights("gate").astype(np.float64) @ hidden_host
+                    expected_up = artifact.reconstruct_weights("up").astype(np.float64) @ hidden_host
+                    np.testing.assert_allclose(
+                        second.output["gate"].cpu().numpy(),
+                        expected_gate,
+                        rtol=2e-4,
+                        atol=2e-4,
+                    )
+                    np.testing.assert_allclose(
+                        second.output["up"].cpu().numpy(),
+                        expected_up,
+                        rtol=2e-4,
+                        atol=2e-4,
+                    )
+                    self.assertEqual(first_result["activation_d2d_bytes"], 0)
+                    self.assertEqual(second_result["activation_d2d_bytes"], 0)
+                    self.assertEqual(second_result["activation_h2d_bytes"], 0)
+
+    def test_run_device_async_chain_synchronizes_once_at_end(self) -> None:
+        import torch
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA unavailable")
+        from tests.gguf_fixture import write_fixture
+        from compile_resident_residual_artifact import compile_layer
+        from resident_residual_format import ResidentArtifact
+        from resident_tiled_ffn import TiledResidentGateUp
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_fixture(root / "fixture.gguf")
+            compile_layer(root / "fixture.gguf", 0, 4, root / "artifact")
+            with ResidentArtifact.open(root / "artifact") as artifact:
+                with TiledResidentGateUp(
+                    artifact,
+                    tile_rows=256,
+                    persistent=True,
+                    base_on_gpu=True,
+                ) as first, TiledResidentGateUp(
+                    artifact,
+                    tile_rows=256,
+                    persistent=True,
+                    base_on_gpu=True,
+                ) as second:
+                    stream = torch.cuda.Stream()
+                    x = torch.randn(first.cols, device="cuda", dtype=torch.float32)
+                    with torch.cuda.stream(stream):
+                        first_result = first.run_device(
+                            x,
+                            stream=stream,
+                            return_outputs=False,
+                            synchronize=False,
+                        )
+                        second_result = second.run_device(
+                            first.output["swiglu"],
+                            stream=stream,
+                            return_outputs=False,
+                            synchronize=False,
+                        )
+                    self.assertFalse(first_result["synchronized"])
+                    self.assertFalse(second_result["synchronized"])
+                    self.assertIsNotNone(first_result["completion_event"])
+                    self.assertIsNotNone(second_result["completion_event"])
+                    stream.synchronize()
+                    hidden = first.output["swiglu"].cpu().numpy()
+                    expected_gate = artifact.reconstruct_weights("gate").astype(np.float64) @ hidden
+                    expected_up = artifact.reconstruct_weights("up").astype(np.float64) @ hidden
+                    np.testing.assert_allclose(
+                        second.output["gate"].cpu().numpy(),
+                        expected_gate,
+                        rtol=2e-4,
+                        atol=2e-4,
+                    )
+                    np.testing.assert_allclose(
+                        second.output["up"].cpu().numpy(),
+                        expected_up,
+                        rtol=2e-4,
+                        atol=2e-4,
+                    )
+                    self.assertEqual(second_result["activation_h2d_bytes"], 0)
+                    self.assertEqual(second_result["activation_d2d_bytes"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

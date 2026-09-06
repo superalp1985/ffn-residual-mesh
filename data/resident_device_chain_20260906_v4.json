@@ -1,0 +1,38 @@
+{
+  "status": "measured_two_layer_gpu_resident_device_chain",
+  "layers": [
+    3,
+    21
+  ],
+  "warmup": 5,
+  "repeats": 7,
+  "sync_chain_wall_ms_median": 11.794299934990704,
+  "sync_chain_wall_ms_p95": 11.92025999771431,
+  "sync_chain_gpu_ms_median": 11.75551986694336,
+  "sync_chain_gpu_ms_p95": 11.872115135192871,
+  "async_chain_gpu_ms_median": 6.599679946899414,
+  "async_chain_gpu_ms_p95": 8.754688072204587,
+  "async_cpu_enqueue_ms_median": 0.6264999974519014,
+  "activation_h2d_bytes_per_layer": [
+    0,
+    0
+  ],
+  "activation_d2d_bytes_per_layer": [
+    0,
+    0
+  ],
+  "base_h2d_bytes_per_layer": [
+    0,
+    0
+  ],
+  "resident_weight_h2d_bytes_per_layer": [
+    0,
+    0
+  ],
+  "first_kernel_mode": "device_activation_fused_base_residual_swiglu",
+  "second_kernel_mode": "device_activation_fused_base_residual_swiglu",
+  "device": "NVIDIA GeForce RTX 4070 Laptop GPU",
+  "torch": "2.9.1+cu130",
+  "cuda": "13.0",
+  "note": "Two artifacts are chained on one CUDA stream to measure host-gap removal. This is not end-to-end generation."
+}

@@ -26,6 +26,8 @@ class TiledResidentGateUp:
         persistent: bool = False,
         base_on_gpu: bool = False,
         use_cuda_graph: bool = False,
+        block_rows: int = 2,
+        num_warps: int = 2,
         device: str | torch.device = "cuda",
     ) -> None:
         if not torch.cuda.is_available():
@@ -34,6 +36,12 @@ class TiledResidentGateUp:
         self.device = torch.device(device)
         self.base_on_gpu = bool(base_on_gpu)
         self.use_cuda_graph = bool(use_cuda_graph)
+        if block_rows not in (1, 2, 4, 8):
+            raise ValueError("block_rows must be one of 1, 2, 4, 8")
+        if num_warps not in (2, 4, 8):
+            raise ValueError("num_warps must be 2, 4, or 8")
+        self.block_rows = int(block_rows)
+        self.num_warps = int(num_warps)
         self.rows = int(artifact.projections["gate"]["rows"])
         self.cols = int(artifact.projections["gate"]["cols"])
         self.plan = TilePlan(
@@ -143,6 +151,8 @@ class TiledResidentGateUp:
                 self.output["swiglu"],
                 rows=self.rows,
                 cols=self.cols,
+                block_rows=self.block_rows,
+                num_warps=self.num_warps,
             )
             if down is not None:
                 down.launch(self.output["swiglu"])
@@ -166,6 +176,8 @@ class TiledResidentGateUp:
                 self.output["swiglu"],
                 rows=self.rows,
                 cols=self.cols,
+                block_rows=self.block_rows,
+                num_warps=self.num_warps,
             )
             if down is not None:
                 down.launch(self.output["swiglu"])
@@ -258,6 +270,8 @@ class TiledResidentGateUp:
                     self.output["swiglu"],
                     rows=stop - start,
                     cols=self.cols,
+                    block_rows=self.block_rows,
+                    num_warps=self.num_warps,
                 )
                 end_event.record()
                 residual_end.record()
@@ -279,9 +293,11 @@ class TiledResidentGateUp:
                         package["up.alpha"],
                         self.device_x,
                         self.residual["gate"][start:stop],
-                        self.residual["up"][start:stop],
-                        rows=stop - start,
-                        cols=self.cols,
+                self.residual["up"][start:stop],
+                rows=stop - start,
+                cols=self.cols,
+                block_rows=self.block_rows,
+                num_warps=self.num_warps,
                     )
                     end_event.record()
                 tile_events.append((begin_event, end_event))
@@ -364,6 +380,204 @@ class TiledResidentGateUp:
         }
         if down is not None:
             result["down_stream_ms"] = float(down_begin.elapsed_time(down_end))
+        if return_outputs:
+            result.update({
+                name: output.cpu().numpy()
+                for name, output in self.output.items()
+            })
+            if down is not None:
+                result["down"] = down.output.cpu().numpy()
+        return result
+
+    def run_device(
+        self,
+        activation: torch.Tensor,
+        *,
+        down=None,
+        stream: torch.cuda.Stream | None = None,
+        return_outputs: bool = True,
+        synchronize: bool = True,
+        measure_events: bool = True,
+    ) -> dict[str, object]:
+        """Run a full resident layer from a CUDA activation without host staging.
+
+        This path is intended for chaining FFN layers or adjacent GPU-resident
+        operators. It computes group sums on CUDA, so no activation or base
+        vector crosses H2D. A caller may pass one shared stream to impose
+        ordering across several layer runners. Set ``synchronize=False`` and
+        ``return_outputs=False`` to enqueue several layers and synchronize the
+        shared stream once at the end; the returned completion event marks the
+        device output boundary.
+        """
+        if not synchronize and return_outputs:
+            raise ValueError("asynchronous device runs require return_outputs=False")
+        expected_device = self.device.index
+        if expected_device is None:
+            expected_device = torch.cuda.current_device()
+        if (
+            activation.device.type != "cuda"
+            or activation.device.index != expected_device
+            or activation.dtype != torch.float32
+        ):
+            raise ValueError("device activation must be a CUDA fp32 tensor on the runner device")
+        if activation.ndim != 1 or activation.numel() != self.cols:
+            raise ValueError("device activation shape does not match gate/up input width")
+        if not activation.is_contiguous():
+            raise ValueError("device activation must be contiguous")
+        if not self.base_on_gpu or len(self.plan.tile_slices()) != 1:
+            raise RuntimeError(
+                "run_device requires base_on_gpu=True and a full resident super-tile"
+            )
+        if down is not None and (down.cols != self.rows or down.rows != self.cols):
+            raise ValueError("down projection dimensions must reverse gate/up dimensions")
+
+        # With no explicit stream, use the caller's current stream. This makes
+        # a tensor produced by the preceding GPU layer safe to consume without
+        # an implicit host round-trip or an unknown cross-stream dependency.
+        run_stream = stream or torch.cuda.current_stream(self.device)
+        begin = time.perf_counter()
+        base_begin = torch.cuda.Event(enable_timing=True) if measure_events else None
+        base_end = torch.cuda.Event(enable_timing=True) if measure_events else None
+        fused_begin = torch.cuda.Event(enable_timing=True) if measure_events else None
+        fused_end = torch.cuda.Event(enable_timing=True) if measure_events else None
+        down_begin = (
+            torch.cuda.Event(enable_timing=True)
+            if down is not None and measure_events else None
+        )
+        down_end = (
+            torch.cuda.Event(enable_timing=True)
+            if down is not None and measure_events else None
+        )
+
+        assert self.device_group_sums is not None
+        # The device path already receives activation from the caller's CUDA
+        # stream. Keep the reduction on that same stream: a second stream would
+        # add an event dependency without hiding any H2D work.
+        with torch.cuda.stream(run_stream):
+            if base_begin is not None:
+                base_begin.record()
+            torch.sum(
+                activation.view(-1, 32),
+                dim=1,
+                dtype=torch.float32,
+                out=self.device_group_sums,
+            )
+            if base_end is not None:
+                base_end.record()
+
+        with torch.cuda.stream(run_stream):
+            # Operations submitted to one CUDA stream are already ordered.
+            # Waiting on an event recorded by this same stream adds no DMA
+            # overlap and only creates another dependency node.
+            self.cache.acquire(0)
+            package = self.cache.package(0)
+            if fused_begin is not None:
+                fused_begin.record()
+            launch_fused_gate_up_base_residual(
+                package["gate.residual"],
+                package["gate.alpha"],
+                package["up.residual"],
+                package["up.alpha"],
+                self.base_resident["gate"],
+                self.base_resident["up"],
+                self.device_group_sums,
+                activation,
+                self.output["gate"],
+                self.output["up"],
+                self.output["swiglu"],
+                rows=self.rows,
+                cols=self.cols,
+                block_rows=self.block_rows,
+                num_warps=self.num_warps,
+            )
+            if fused_end is not None:
+                fused_end.record()
+            if down is not None:
+                if down_begin is not None:
+                    down_begin.record()
+                down.launch(self.output["swiglu"])
+                if down_end is not None:
+                    down_end.record()
+            completion_event = torch.cuda.Event(enable_timing=True)
+            completion_event.record()
+            self.cache.release(0)
+
+        enqueue_wall_ms = (time.perf_counter() - begin) * 1000
+        if not synchronize:
+            result: dict[str, object] = {
+                "cpu_base_ms": 0.0,
+                "activation_h2d_ms": 0.0,
+                "activation_d2d_ms": 0.0,
+                "base_compute_ms": None,
+                "tile_kernel_ms": None,
+                "fused_base_residual_swiglu_ms": None,
+                "base_h2d_ms": 0.0,
+                "merge_swiglu_ms": 0.0,
+                "wall_ms": None,
+                "enqueue_wall_ms": enqueue_wall_ms,
+                "activation_h2d_bytes": 0,
+                "activation_d2d_bytes": 0,
+                "base_h2d_bytes": 0,
+                "base_resident_bytes": sum(
+                    value.numel() * value.element_size()
+                    for value in self.base_resident.values()
+                ),
+                "weight_h2d_bytes": self.cache.traffic["weight_h2d_bytes"],
+                "resident_weight_h2d_bytes": 0,
+                "tile_count": 1,
+                "base_compute_device": "cuda",
+                "kernel_mode": "device_activation_fused_base_residual_swiglu",
+                "activation_source": "caller_gpu_tensor",
+                "synchronized": False,
+                "timing_events": measure_events,
+                "completion_event": completion_event,
+            }
+            if down is not None:
+                result["down_stream_ms"] = None
+            return result
+
+        completion_event.synchronize()
+        wall_ms = (time.perf_counter() - begin) * 1000
+        result: dict[str, object] = {
+            "cpu_base_ms": 0.0,
+            "activation_h2d_ms": 0.0,
+            "activation_d2d_ms": 0.0,
+            "base_compute_ms": (
+                float(base_begin.elapsed_time(base_end))
+                if base_begin is not None and base_end is not None else None
+            ),
+            "tile_kernel_ms": (
+                float(fused_begin.elapsed_time(fused_end))
+                if fused_begin is not None and fused_end is not None else None
+            ),
+            "fused_base_residual_swiglu_ms": (
+                float(fused_begin.elapsed_time(fused_end))
+                if fused_begin is not None and fused_end is not None else None
+            ),
+            "base_h2d_ms": 0.0,
+            "merge_swiglu_ms": 0.0,
+            "wall_ms": wall_ms,
+            "activation_h2d_bytes": 0,
+            "activation_d2d_bytes": 0,
+            "base_h2d_bytes": 0,
+            "base_resident_bytes": sum(
+                value.numel() * value.element_size()
+                for value in self.base_resident.values()
+            ),
+            "weight_h2d_bytes": self.cache.traffic["weight_h2d_bytes"],
+            "resident_weight_h2d_bytes": 0,
+            "tile_count": 1,
+            "base_compute_device": "cuda",
+            "kernel_mode": "device_activation_fused_base_residual_swiglu",
+            "activation_source": "caller_gpu_tensor",
+            "synchronized": True,
+            "timing_events": measure_events,
+        }
+        if down is not None:
+            result["down_stream_ms"] = (
+                float(down_begin.elapsed_time(down_end))
+                if down_begin is not None and down_end is not None else None
+            )
         if return_outputs:
             result.update({
                 name: output.cpu().numpy()

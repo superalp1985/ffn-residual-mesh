@@ -1,0 +1,57 @@
+{
+  "status": "resident_ffn_timeline",
+  "layer": 21,
+  "dimensions": {
+    "rows": 17408,
+    "cols": 5120
+  },
+  "block_rows": 2,
+  "num_warps": 2,
+  "down": true,
+  "stages": {
+    "group_sum": {
+      "gpu_median_ms": 0.01923200022429228,
+      "gpu_p95_ms": 0.03585760053247212,
+      "host_wall_median_ms": 0.039700011257082224,
+      "host_wall_p95_ms": 0.06556499283760783
+    },
+    "fused_gate_up_base_residual_swiglu": {
+      "gpu_median_ms": 0.8456799983978271,
+      "gpu_p95_ms": 1.6461824119091033,
+      "host_wall_median_ms": 0.8958500111475587,
+      "host_wall_p95_ms": 1.759529928676784
+    },
+    "down_iq4_nl": {
+      "gpu_median_ms": 0.4904960095882416,
+      "gpu_p95_ms": 0.8105247914791103,
+      "host_wall_median_ms": 0.5135999526828527,
+      "host_wall_p95_ms": 1.0532899759709833
+    }
+  },
+  "chain": {
+    "group_sum_ms": 0.07363200187683105,
+    "fused_ms": 1.486847996711731,
+    "down_ms": 0.4700160026550293,
+    "gpu_span_ms": 2.0304958820343018,
+    "host_enqueue_and_wait_ms": 2.0703000482171774,
+    "launch_gap_proxy_ms": 0.0
+  },
+  "gpu_before": {
+    "pstate": "P0",
+    "clocks.sm": "2115",
+    "clocks.mem": "8001",
+    "power.draw": "19.88",
+    "utilization.gpu": "56",
+    "utilization.memory": "21"
+  },
+  "gpu_after": {
+    "pstate": "P3",
+    "clocks.sm": "2115",
+    "clocks.mem": "7001",
+    "power.draw": "31.04",
+    "utilization.gpu": "29",
+    "utilization.memory": "19"
+  },
+  "resident_bytes": 133693440,
+  "note": "GPU event timings measure device execution. This does not claim Nsight occupancy or hardware DMA counters."
+}
