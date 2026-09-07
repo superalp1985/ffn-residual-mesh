@@ -8,6 +8,8 @@ import numpy as np
 
 
 FORMAT = "FFN_RESIDENT_CENTERED_Q4_V1"
+FORMAT_V2 = "FFN_RESIDENT_CENTERED_AFFINE_V2"
+PACKING = {4: "signed_nibble_pairs_v1", 5: "group32_nibbles_highbits_v2"}
 
 
 def file_sha256(path: Path) -> str:
@@ -30,14 +32,22 @@ class ResidentArtifact:
     def open(cls, path: Path, *, verify_hashes: bool = False) -> ResidentArtifact:
         manifest_path = path / "manifest.json" if path.is_dir() else path
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if manifest.get("format") != FORMAT or manifest.get("residual_bits") != 4:
+        version = manifest.get("format")
+        if (version not in (FORMAT, FORMAT_V2)
+                or (version == FORMAT and manifest.get("residual_bits") != 4)):
             raise ValueError("unsupported resident artifact format")
         result = cls(manifest_path.parent.resolve(), manifest)
         try:
             for name, projection in result.projections.items():
                 rows, cols = projection["rows"], projection["cols"]
+                bits = result.residual_bits(name)
+                if version == FORMAT_V2:
+                    if (bits not in PACKING or projection.get("packing") != PACKING[bits]
+                            or projection["source"]["type_name"] != f"Q{bits}_K"
+                            or manifest.get("group_size") != 32):
+                        raise ValueError("invalid affine residual bitwidth or packing descriptor")
                 shapes = {
-                    "residual": ([rows, cols // 2], "|u1"),
+                    "residual": ([rows, cols * bits // 8], "|u1"),
                     "base": ([rows, cols // 32], "|u1"),
                     "alpha": ([rows, cols // 32], "<f4"),
                     "beta": ([rows, cols // 32], "<f4"),
@@ -105,9 +115,25 @@ class ResidentArtifact:
                    for name in ("gate", "up") if name in self.projections
                    for kind in ("residual", "alpha"))
 
+    def residual_bits(self, name: str) -> int:
+        if self.manifest["format"] == FORMAT:
+            return 4
+        return self.projections[name].get("residual_bits")
+
     def unpack_residual(self, name: str, start: int = 0, stop: int | None = None) -> np.ndarray:
         packed = self.arrays[name]["residual"][start:stop]
-        output = np.empty((packed.shape[0], packed.shape[1] * 2), dtype=np.int8)
+        bits = self.residual_bits(name)
+        cols = self.projections[name]["cols"]
+        if bits == 5:
+            groups = packed.reshape(packed.shape[0], cols // 32, 20)
+            codes = np.empty((packed.shape[0], cols // 32, 32), dtype=np.uint8)
+            codes[:, :, 0::2] = groups[:, :, :16] & 15
+            codes[:, :, 1::2] = groups[:, :, :16] >> 4
+            codes |= np.unpackbits(groups[:, :, 16:], axis=-1, bitorder="little") << 4
+            signed = codes.astype(np.int8)
+            signed[signed >= 16] -= 32
+            return signed.reshape(packed.shape[0], cols)
+        output = np.empty((packed.shape[0], cols), dtype=np.int8)
         for shift, offset in ((0, 0), (4, 1)):
             nibble = ((packed >> shift) & 15).astype(np.int16)
             output[:, offset::2] = np.where(nibble >= 8, nibble - 16, nibble)
@@ -117,8 +143,8 @@ class ResidentArtifact:
         residual = self.unpack_residual(name, start, stop)
         codes = residual.reshape(residual.shape[0], -1, 32).astype(np.int16)
         codes += self.arrays[name]["base"][start:stop, :, None]
-        if np.any((codes < 0) | (codes > 15)):
-            raise ValueError("reconstructed code outside Q4 range")
+        if np.any((codes < 0) | (codes >= (1 << self.residual_bits(name)))):
+            raise ValueError("reconstructed code outside quantizer range")
         return codes.reshape(residual.shape).astype(np.uint8)
 
     def reconstruct_weights(self, name: str, start: int = 0, stop: int | None = None) -> np.ndarray:

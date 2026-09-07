@@ -138,6 +138,11 @@ def run_resident_ffn(layer_artifact: Path, *, repeats: int = 9, seed: int = 2026
             "layer": layer,
             "dimensions": {"hidden": runner.cols, "ffn": runner.rows},
             "merge_order": "gate_up_before_swiglu",
+            "artifact_format": artifact.manifest["format"],
+            "gate_up_quant_types": {
+                p: artifact.projections[p]["source"]["type_name"] for p in ("gate", "up")
+            },
+            "residual_bits": dict(runner.bits),
             "residual_kernel": residual_kernel,
             "residual_kernel_config": {
                 "block_rows": block_rows,

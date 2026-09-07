@@ -615,10 +615,32 @@ def _residual_dot(packed, alpha, x, output, ROWS: tl.constexpr, COLS: tl.constex
 
 
 @triton.jit
+def _load_residual_pair(packed, row, group, byte, mask,
+                        GROUPS: tl.constexpr, BITS: tl.constexpr):
+    group_bytes: tl.constexpr = 16 if BITS == 4 else 20
+    offset = row[:, None, None] * (GROUPS * group_bytes) + group[None, :, None] * group_bytes
+    value = tl.load(packed + offset + byte[None, None, :], mask, other=0).to(tl.int32)
+    low = value & 15
+    high = (value >> 4) & 15
+    if BITS == 5:
+        # Four consecutive residual pairs share one high-plane byte.
+        plane = tl.load(
+            packed + offset + 16 + byte[None, None, :] // 4, mask, other=0,
+        ).to(tl.int32)
+        shift = (byte[None, None, :] % 4) * 2
+        low |= ((plane >> shift) & 1) << 4
+        high |= ((plane >> (shift + 1)) & 1) << 4
+    limit: tl.constexpr = 1 << (BITS - 1)
+    low = tl.where(low >= limit, low - (1 << BITS), low).to(tl.float32)
+    high = tl.where(high >= limit, high - (1 << BITS), high).to(tl.float32)
+    return low, high
+
+
+@triton.jit
 def _residual_dot_grouped(
     packed, alpha, x, output,
     ROWS: tl.constexpr, COLS: tl.constexpr,
-    BLOCK_ROWS: tl.constexpr, BLOCK_GROUPS: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr, BLOCK_GROUPS: tl.constexpr, BITS: tl.constexpr,
 ):
     """Decode one 32-code group from each packed 16-byte segment.
 
@@ -638,16 +660,9 @@ def _residual_dot_grouped(
         group = group_start + group_lane
         group_mask = group < groups
         mask = row_mask[:, None, None] & group_mask[None, :, None]
-        packed_offset = (
-            row[:, None, None] * (COLS // 2)
-            + group[None, :, None] * 16
-            + byte[None, None, :]
+        low, high = _load_residual_pair(
+            packed, row, group, byte, mask, GROUPS=groups, BITS=BITS,
         )
-        value = tl.load(packed + packed_offset, mask=mask, other=0).to(tl.int32)
-        low = value & 15
-        high = (value >> 4) & 15
-        low = tl.where(low >= 8, low - 16, low).to(tl.float32)
-        high = tl.where(high >= 8, high - 16, high).to(tl.float32)
         scale = tl.load(
             alpha + row[:, None] * groups + group[None, :],
             mask=row_mask[:, None] & group_mask[None, :],
@@ -679,6 +694,7 @@ def _fused_gate_up_residual_grouped(
     gate_output, up_output,
     ROWS: tl.constexpr, COLS: tl.constexpr,
     BLOCK_ROWS: tl.constexpr, BLOCK_GROUPS: tl.constexpr,
+    GATE_BITS: tl.constexpr, UP_BITS: tl.constexpr,
 ):
     """Grouped gate/up residual GEMV sharing one activation decode per CTA."""
     row = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
@@ -693,11 +709,6 @@ def _fused_gate_up_residual_grouped(
         group = group_start + group_lane
         group_mask = group < groups
         mask = row_mask[:, None, None] & group_mask[None, :, None]
-        packed_offset = (
-            row[:, None, None] * (COLS // 2)
-            + group[None, :, None] * 16
-            + byte[None, None, :]
-        )
         low_x = tl.load(
             x + group[:, None] * 32 + byte[None, :] * 2,
             mask=group_mask[:, None],
@@ -709,13 +720,9 @@ def _fused_gate_up_residual_grouped(
             other=0.0,
         )
 
-        gate_value = tl.load(
-            gate_packed + packed_offset, mask=mask, other=0
-        ).to(tl.int32)
-        gate_low = gate_value & 15
-        gate_high = (gate_value >> 4) & 15
-        gate_low = tl.where(gate_low >= 8, gate_low - 16, gate_low).to(tl.float32)
-        gate_high = tl.where(gate_high >= 8, gate_high - 16, gate_high).to(tl.float32)
+        gate_low, gate_high = _load_residual_pair(
+            gate_packed, row, group, byte, mask, GROUPS=groups, BITS=GATE_BITS,
+        )
         gate_scale = tl.load(
             gate_alpha + row[:, None] * groups + group[None, :],
             mask=row_mask[:, None] & group_mask[None, :],
@@ -728,13 +735,9 @@ def _fused_gate_up_residual_grouped(
         )
         gate_accum += tl.sum(gate_dot, axis=1)
 
-        up_value = tl.load(
-            up_packed + packed_offset, mask=mask, other=0
-        ).to(tl.int32)
-        up_low = up_value & 15
-        up_high = (up_value >> 4) & 15
-        up_low = tl.where(up_low >= 8, up_low - 16, up_low).to(tl.float32)
-        up_high = tl.where(up_high >= 8, up_high - 16, up_high).to(tl.float32)
+        up_low, up_high = _load_residual_pair(
+            up_packed, row, group, byte, mask, GROUPS=groups, BITS=UP_BITS,
+        )
         up_scale = tl.load(
             up_alpha + row[:, None] * groups + group[None, :],
             mask=row_mask[:, None] & group_mask[None, :],
@@ -763,7 +766,12 @@ def _launch_residual_dot(
     num_warps: int,
     kernel: str,
     block_groups: int = 32,
+    bits: int = 4,
 ) -> object:
+    if bits not in (4, 5) or (bits == 5 and kernel != "grouped"):
+        raise ValueError("Q5 residuals require grouped execution; supported bitwidths are 4/5")
+    if packed.shape != (rows, cols * bits // 8):
+        raise ValueError("residual storage does not match bitwidth")
     if kernel == "legacy":
         return _residual_dot[(triton.cdiv(rows, block_rows),)](
             packed, alpha, device_x, output,
@@ -776,6 +784,7 @@ def _launch_residual_dot(
             packed, alpha, device_x, output,
             ROWS=rows, COLS=cols,
             BLOCK_ROWS=block_rows, BLOCK_GROUPS=block_groups,
+            BITS=bits,
             num_warps=num_warps, enable_fp_fusion=False,
         )
     raise ValueError(f"unsupported residual kernel: {kernel}")
@@ -795,12 +804,20 @@ def _launch_fused_gate_up_residual_grouped(
     block_rows: int,
     num_warps: int,
     block_groups: int,
+    gate_bits: int = 4,
+    up_bits: int = 4,
 ) -> object:
+    if gate_bits not in (4, 5) or up_bits not in (4, 5):
+        raise ValueError("supported residual bitwidths are 4/5")
+    if (gate_packed.shape != (rows, cols * gate_bits // 8)
+            or up_packed.shape != (rows, cols * up_bits // 8)):
+        raise ValueError("residual storage does not match bitwidth")
     return _fused_gate_up_residual_grouped[(triton.cdiv(rows, block_rows),)](
         gate_packed, gate_alpha, up_packed, up_alpha, device_x,
         gate_output, up_output,
         ROWS=rows, COLS=cols,
         BLOCK_ROWS=block_rows, BLOCK_GROUPS=block_groups,
+        GATE_BITS=gate_bits, UP_BITS=up_bits,
         num_warps=num_warps, enable_fp_fusion=False,
     )
 
@@ -1246,7 +1263,10 @@ class ResidentGateUp:
         if residual_block_groups not in (8, 16, 32, 64, 128):
             raise ValueError("invalid residual block group count")
         if not all(p in artifact.projections for p in ("gate", "up")):
-            raise ValueError("both gate and up must have compiled Q4_K projections")
+            raise ValueError("both gate and up must have compiled affine projections")
+        self.bits = {p: artifact.residual_bits(p) for p in ("gate", "up")}
+        if 5 in self.bits.values() and residual_kernel == "legacy":
+            raise ValueError("Q5 residuals require grouped or grouped_fused execution")
         self.rows = artifact.projections["gate"]["rows"]
         self.cols = artifact.projections["gate"]["cols"]
         if any((artifact.projections[p]["rows"], artifact.projections[p]["cols"]) != (self.rows, self.cols)
@@ -1292,6 +1312,7 @@ class ResidentGateUp:
                 rows=self.rows, cols=self.cols,
                 block_rows=self.block_rows, num_warps=self.num_warps,
                 block_groups=self.residual_block_groups,
+                gate_bits=self.bits["gate"], up_bits=self.bits["up"],
             )
             self.kernel_resources = [{
                 "projection": "gate_up_fused",
@@ -1308,6 +1329,7 @@ class ResidentGateUp:
                 block_rows=self.block_rows, num_warps=self.num_warps,
                 kernel=self.residual_kernel,
                 block_groups=self.residual_block_groups,
+                bits=self.bits[p],
             )
             resources.append({"projection": p, "registers_per_thread": compiled.n_regs,
                               "spills": compiled.n_spills, "shared_bytes": compiled.metadata.shared})

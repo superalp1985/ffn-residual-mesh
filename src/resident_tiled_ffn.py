@@ -31,6 +31,8 @@ class TiledResidentGateUp:
         pipeline_depth: int = 3,
         device: str | torch.device = "cuda",
     ) -> None:
+        if any(artifact.residual_bits(name) != 4 for name in ("gate", "up")):
+            raise ValueError("tiled execution currently supports Q4 residual packing only")
         if not torch.cuda.is_available():
             raise RuntimeError("TiledResidentGateUp requires CUDA")
         self.artifact = artifact
