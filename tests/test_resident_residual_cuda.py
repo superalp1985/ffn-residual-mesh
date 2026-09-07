@@ -85,6 +85,57 @@ class ResidentCudaTests(unittest.TestCase):
                     atol=1e-5,
                 )
 
+    def test_q5k_down_matches_reference_including_partial_tiles(self):
+        import torch
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA device unavailable")
+        from gguf import GGMLQuantizationType
+        from gguf.quants import dequantize
+        from resident_residual_cuda import DirectQ5Projection
+
+        rng = np.random.default_rng(554)
+        for cols in (256, 512, 1280):
+            raw = rng.integers(0, 256, (23, cols // 256, 176), dtype=np.uint8)
+            raw[:, :, :2] = np.array([0.002], dtype="<f2").view(np.uint8)
+            raw[:, :, 2:4] = np.array([0.001], dtype="<f2").view(np.uint8)
+            raw = raw.reshape(23, -1)
+            x = rng.standard_normal(cols).astype(np.float32)
+            expected = dequantize(raw, GGMLQuantizationType.Q5_K).astype(np.float64) @ x
+            for qblocks in (1, 2, 4):
+                with self.subTest(cols=cols, qblocks=qblocks):
+                    projection = DirectQ5Projection(
+                        raw, cols, block_rows=2, num_warps=2, block_qblocks=qblocks,
+                    )
+                    projection.launch(torch.from_numpy(x).cuda())
+                    np.testing.assert_allclose(
+                        projection.output.cpu().numpy(), expected, rtol=2e-5, atol=2e-5,
+                    )
+
+    def test_iq4xs_down_matches_reference_including_partial_tiles(self):
+        import torch
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA device unavailable")
+        from gguf import GGMLQuantizationType
+        from gguf.quants import dequantize
+        from resident_residual_cuda import DirectIQ4XSProjection
+
+        rng = np.random.default_rng(555)
+        for cols in (256, 512, 1280):
+            raw = rng.integers(0, 256, (23, cols // 256, 136), dtype=np.uint8)
+            raw[:, :, :2] = np.array([0.002], dtype="<f2").view(np.uint8)
+            raw = raw.reshape(23, -1)
+            x = rng.standard_normal(cols).astype(np.float32)
+            expected = dequantize(raw, GGMLQuantizationType.IQ4_XS).astype(np.float64) @ x
+            for qblocks in (1, 2, 4):
+                with self.subTest(cols=cols, qblocks=qblocks):
+                    projection = DirectIQ4XSProjection(
+                        raw, cols, block_rows=2, num_warps=2, block_qblocks=qblocks,
+                    )
+                    projection.launch(torch.from_numpy(x).cuda())
+                    np.testing.assert_allclose(
+                        projection.output.cpu().numpy(), expected, rtol=2e-5, atol=2e-5,
+                    )
+
     def test_q4k_rejects_invalid_chunk_before_gpu_upload(self):
         from resident_residual_cuda import DirectQ4Projection
 

@@ -203,6 +203,115 @@ def _fused_q4k_grouped(
 
 
 @triton.jit
+def _fused_q5k_grouped(
+    raw,
+    x,
+    output,
+    ROWS: tl.constexpr,
+    COLS: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    BLOCK_QBLOCKS: tl.constexpr,
+):
+    """Q5_K GEMV sharing packed headers, low nibbles, and high-bit planes."""
+    row = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    row_mask = row < ROWS
+    qblock_lane = tl.arange(0, BLOCK_QBLOCKS)
+    byte = tl.arange(0, 32)
+    qblocks = COLS // 256
+    row_bytes = qblocks * 176
+    acc = tl.zeros((BLOCK_ROWS,), dtype=tl.float32)
+
+    for qblock_start in range(0, qblocks, BLOCK_QBLOCKS):
+        qblock = qblock_start + qblock_lane
+        qblock_mask = qblock < qblocks
+        block = raw + row[:, None] * row_bytes + qblock[None, :] * 176
+        header_mask = row_mask[:, None] & qblock_mask[None, :]
+        d_bits = (
+            tl.load(block, header_mask, other=0).to(tl.uint32)
+            | (tl.load(block + 1, header_mask, other=0).to(tl.uint32) << 8)
+        )
+        m_bits = (
+            tl.load(block + 2, header_mask, other=0).to(tl.uint32)
+            | (tl.load(block + 3, header_mask, other=0).to(tl.uint32) << 8)
+        )
+        d = tl.cast(d_bits.to(tl.uint16), tl.float16, bitcast=True).to(tl.float32)
+        dm = tl.cast(m_bits.to(tl.uint16), tl.float16, bitcast=True).to(tl.float32)
+
+        for pair in range(0, 4):
+            first_group = pair * 2
+            second_group = first_group + 1
+            first_index = first_group % 4
+            second_index = second_group % 4
+            first_scale_low = tl.load(block + 4 + first_index, header_mask, other=0).to(tl.int32)
+            first_min_low = tl.load(block + 8 + first_index, header_mask, other=0).to(tl.int32)
+            first_mix = tl.load(block + 12 + first_index, header_mask, other=0).to(tl.int32)
+            second_scale_low = tl.load(block + 4 + second_index, header_mask, other=0).to(tl.int32)
+            second_min_low = tl.load(block + 8 + second_index, header_mask, other=0).to(tl.int32)
+            second_mix = tl.load(block + 12 + second_index, header_mask, other=0).to(tl.int32)
+            first_scale = tl.where(
+                first_group < 4,
+                first_scale_low & 63,
+                (first_mix & 15) | ((first_scale_low >> 2) & 48),
+            )
+            first_minimum = tl.where(
+                first_group < 4,
+                first_min_low & 63,
+                (first_mix >> 4) | ((first_min_low >> 2) & 48),
+            )
+            second_scale = tl.where(
+                second_group < 4,
+                second_scale_low & 63,
+                (second_mix & 15) | ((second_scale_low >> 2) & 48),
+            )
+            second_minimum = tl.where(
+                second_group < 4,
+                second_min_low & 63,
+                (second_mix >> 4) | ((second_min_low >> 2) & 48),
+            )
+            value_mask = header_mask[:, :, None]
+            packed_low = tl.load(
+                block[:, :, None] + 48 + pair * 32 + byte[None, None, :],
+                value_mask,
+                other=0,
+            ).to(tl.int32)
+            high_plane = tl.load(
+                block[:, :, None] + 16 + byte[None, None, :],
+                value_mask,
+                other=0,
+            ).to(tl.int32)
+            first_q = (packed_low & 15) | (((high_plane >> first_group) & 1) << 4)
+            second_q = ((packed_low >> 4) & 15) | (((high_plane >> second_group) & 1) << 4)
+            activation_offset = qblock[:, None] * 256 + pair * 64 + byte[None, :]
+            first_x = tl.load(
+                x + activation_offset,
+                mask=qblock_mask[:, None],
+                other=0.0,
+            )
+            second_x = tl.load(
+                x + activation_offset + 32,
+                mask=qblock_mask[:, None],
+                other=0.0,
+            )
+            first_weight = (
+                d[:, :, None] * first_scale[:, :, None].to(tl.float32)
+                * first_q.to(tl.float32)
+                - dm[:, :, None] * first_minimum[:, :, None].to(tl.float32)
+            )
+            second_weight = (
+                d[:, :, None] * second_scale[:, :, None].to(tl.float32)
+                * second_q.to(tl.float32)
+                - dm[:, :, None] * second_minimum[:, :, None].to(tl.float32)
+            )
+            block_dot = tl.sum(
+                first_weight * first_x[None, :, :]
+                + second_weight * second_x[None, :, :],
+                axis=2,
+            )
+            acc += tl.sum(block_dot, axis=1)
+    tl.store(output + row, acc, row_mask)
+
+
+@triton.jit
 def _direct_iq4nl(raw, x, partial, kvalues, ROWS: tl.constexpr, COLS: tl.constexpr,
                   CHUNKS: tl.constexpr, CHUNK_COLS: tl.constexpr,
                   BLOCK_ROWS: tl.constexpr, BLOCK_COLS: tl.constexpr):
@@ -261,6 +370,82 @@ def _fused_iq4nl(raw, x, output, kvalues, ROWS: tl.constexpr, COLS: tl.constexpr
     tl.store(output + row, acc, row_mask)
 
 
+@triton.jit
+def _fused_iq4xs(
+    raw,
+    x,
+    output,
+    kvalues,
+    ROWS: tl.constexpr,
+    COLS: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    BLOCK_QBLOCKS: tl.constexpr,
+):
+    """IQ4_XS GEMV with one scale/header decode per 32-value group."""
+    row = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    row_mask = row < ROWS
+    qblock_lane = tl.arange(0, BLOCK_QBLOCKS)
+    byte = tl.arange(0, 16)
+    qblocks = COLS // 256
+    row_bytes = qblocks * 136
+    acc = tl.zeros((BLOCK_ROWS,), dtype=tl.float32)
+
+    for qblock_start in range(0, qblocks, BLOCK_QBLOCKS):
+        qblock = qblock_start + qblock_lane
+        qblock_mask = qblock < qblocks
+        block = raw + row[:, None] * row_bytes + qblock[None, :] * 136
+        header_mask = row_mask[:, None] & qblock_mask[None, :]
+        d_bits = (
+            tl.load(block, header_mask, other=0).to(tl.uint32)
+            | (tl.load(block + 1, header_mask, other=0).to(tl.uint32) << 8)
+        )
+        d = tl.cast(d_bits.to(tl.uint16), tl.float16, bitcast=True).to(tl.float32)
+        scales_h = (
+            tl.load(block + 2, header_mask, other=0).to(tl.int32)
+            | (tl.load(block + 3, header_mask, other=0).to(tl.int32) << 8)
+        )
+
+        for group in range(0, 8):
+            scale_byte = tl.load(block + 4 + group // 2, header_mask, other=0).to(tl.int32)
+            scale_low = (scale_byte >> ((group % 2) * 4)) & 15
+            scale = (scale_low | (((scales_h >> (group * 2)) & 3) << 4)) - 32
+            value_mask = header_mask[:, :, None]
+            packed = tl.load(
+                block[:, :, None] + 8 + group * 16 + byte[None, None, :],
+                value_mask,
+                other=0,
+            ).to(tl.int32)
+            first_q = packed & 15
+            second_q = (packed >> 4) & 15
+            # Each group stores columns 0..15 in low nibbles and 16..31 in high nibbles.
+            activation_offset = qblock[:, None] * 256 + group * 32 + byte[None, :]
+            first_x = tl.load(
+                x + activation_offset,
+                mask=qblock_mask[:, None],
+                other=0.0,
+            )
+            second_x = tl.load(
+                x + activation_offset + 16,
+                mask=qblock_mask[:, None],
+                other=0.0,
+            )
+            first_weight = (
+                d[:, :, None] * scale[:, :, None].to(tl.float32)
+                * tl.load(kvalues + first_q, first_q < 16, other=0).to(tl.float32)
+            )
+            second_weight = (
+                d[:, :, None] * scale[:, :, None].to(tl.float32)
+                * tl.load(kvalues + second_q, second_q < 16, other=0).to(tl.float32)
+            )
+            block_dot = tl.sum(
+                first_weight * first_x[None, :, :]
+                + second_weight * second_x[None, :, :],
+                axis=2,
+            )
+            acc += tl.sum(block_dot, axis=1)
+    tl.store(output + row, acc, row_mask)
+
+
 class DirectQ4Projection:
     def __init__(
         self,
@@ -303,6 +488,41 @@ class DirectQ4Projection:
         )
 
 
+class DirectQ5Projection:
+    def __init__(
+        self,
+        raw: np.ndarray,
+        cols: int,
+        *,
+        block_rows: int = 2,
+        num_warps: int = 2,
+        block_qblocks: int = 1,
+    ):
+        if raw.dtype != np.uint8 or raw.ndim != 2 or cols % 256 or raw.shape[1] != cols // 256 * 176:
+            raise ValueError("expected row-major raw Q5_K tensor")
+        if block_qblocks not in (1, 2, 4):
+            raise ValueError("block_qblocks must be 1, 2, or 4")
+        self.raw = torch.from_numpy(np.array(raw, copy=True)).cuda()
+        self.rows, self.cols = raw.shape[0], cols
+        self.block_rows, self.num_warps = block_rows, num_warps
+        self.block_qblocks = block_qblocks
+        self.kernel = "grouped_q5_k"
+        self.output = torch.empty(self.rows, device="cuda")
+
+    def launch(self, device_x: torch.Tensor) -> None:
+        _fused_q5k_grouped[(triton.cdiv(self.rows, self.block_rows),)](
+            self.raw,
+            device_x,
+            self.output,
+            ROWS=self.rows,
+            COLS=self.cols,
+            BLOCK_ROWS=self.block_rows,
+            BLOCK_QBLOCKS=self.block_qblocks,
+            num_warps=self.num_warps,
+            enable_fp_fusion=False,
+        )
+
+
 class DirectIQ4NLProjection:
     def __init__(self, raw: np.ndarray, cols: int, *, chunk_cols: int = 1024,
                  block_rows: int = 1, num_warps: int = 1):
@@ -335,6 +555,47 @@ class DirectIQ4NLProjection:
             num_warps=self.num_warps,
             num_stages=2,
             enable_fp_fusion=True,
+        )
+
+
+class DirectIQ4XSProjection:
+    def __init__(
+        self,
+        raw: np.ndarray,
+        cols: int,
+        *,
+        block_rows: int = 2,
+        num_warps: int = 2,
+        block_qblocks: int = 1,
+    ):
+        if raw.dtype != np.uint8 or raw.ndim != 2 or cols % 256 or raw.shape[1] != cols // 256 * 136:
+            raise ValueError("expected row-major raw IQ4_XS tensor")
+        if block_qblocks not in (1, 2, 4):
+            raise ValueError("block_qblocks must be 1, 2, or 4")
+        self.raw = torch.from_numpy(np.array(raw, copy=True)).cuda()
+        self.kvalues = torch.tensor(
+            (-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113),
+            dtype=torch.float32,
+            device="cuda",
+        )
+        self.rows, self.cols = raw.shape[0], cols
+        self.block_rows, self.num_warps = block_rows, num_warps
+        self.block_qblocks = block_qblocks
+        self.kernel = "grouped_iq4_xs"
+        self.output = torch.empty(self.rows, device="cuda")
+
+    def launch(self, device_x: torch.Tensor) -> None:
+        _fused_iq4xs[(triton.cdiv(self.rows, self.block_rows),)](
+            self.raw,
+            device_x,
+            self.output,
+            self.kvalues,
+            ROWS=self.rows,
+            COLS=self.cols,
+            BLOCK_ROWS=self.block_rows,
+            BLOCK_QBLOCKS=self.block_qblocks,
+            num_warps=self.num_warps,
+            enable_fp_fusion=False,
         )
 
 

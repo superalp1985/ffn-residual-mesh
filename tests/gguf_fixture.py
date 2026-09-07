@@ -5,7 +5,8 @@ from gguf import GGMLQuantizationType as QuantType, GGUFWriter
 
 
 def write_fixture(path: Path, *, missing_up: bool = False, mtp_layers: int = 0,
-                  quantized_down: bool = False, q4k_down: bool = False) -> dict:
+                  quantized_down: bool = False, q4k_down: bool = False,
+                  q5k_down: bool = False, iq4xs_down: bool = False) -> dict:
     """Small real GGUF; its random Q4_K bytes exercise all nibble/scale bits."""
     rng = np.random.default_rng(513)
     writer = GGUFWriter(path, "qwen35")
@@ -24,12 +25,27 @@ def write_fixture(path: Path, *, missing_up: bool = False, mtp_layers: int = 0,
         raw[:, 2:4] = np.array([0.001], dtype="<f2").view(np.uint8)
         writer.add_tensor(f"blk.0.ffn_{name}.weight", raw, raw_dtype=QuantType.Q4_K)
         original[name] = raw
+    if sum((quantized_down, q4k_down, q5k_down, iq4xs_down)) > 1:
+        raise ValueError("select at most one quantized down fixture")
     if q4k_down:
         down = rng.integers(0, 256, (256, 144), dtype=np.uint8)
         down[:, :2] = np.array([0.001], dtype="<f2").view(np.uint8)
         down[:, 2:4] = np.array([0.0005], dtype="<f2").view(np.uint8)
         writer.add_tensor(
             "blk.0.ffn_down.weight", down, raw_dtype=QuantType.Q4_K
+        )
+    elif q5k_down:
+        down = rng.integers(0, 256, (256, 176), dtype=np.uint8)
+        down[:, :2] = np.array([0.001], dtype="<f2").view(np.uint8)
+        down[:, 2:4] = np.array([0.0005], dtype="<f2").view(np.uint8)
+        writer.add_tensor(
+            "blk.0.ffn_down.weight", down, raw_dtype=QuantType.Q5_K
+        )
+    elif iq4xs_down:
+        down = rng.integers(0, 256, (256, 136), dtype=np.uint8)
+        down[:, :2] = np.array([0.001], dtype="<f2").view(np.uint8)
+        writer.add_tensor(
+            "blk.0.ffn_down.weight", down, raw_dtype=QuantType.IQ4_XS
         )
     elif quantized_down:
         down = rng.integers(0, 256, (256, 8, 18), dtype=np.uint8)

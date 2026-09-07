@@ -12,19 +12,25 @@ from gguf import GGUFReader
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from resident_residual_cuda import DirectIQ4NLProjection  # noqa: E402
 from resident_residual_format import ResidentArtifact  # noqa: E402
 from resident_tiled_ffn import TiledResidentGateUp  # noqa: E402
+from sweep_mixed_down_kernel import build_projection  # noqa: E402
 
 
-def make_down(model: Path, layer: int) -> DirectIQ4NLProjection:
+def make_down(model: Path, layer: int):
     reader = GGUFReader(model)
     try:
         tensor = next(
             item for item in reader.tensors
             if item.name == f"blk.{layer}.ffn_down.weight"
         )
-        return DirectIQ4NLProjection(tensor.data, int(tensor.shape[0]))
+        projection, _ = build_projection(
+            tensor,
+            block_rows=2,
+            num_warps=2,
+            block_qblocks=4,
+        )
+        return projection
     finally:
         reader.data._mmap.close()
 

@@ -13,8 +13,9 @@ from gguf.quants import dequantize
 from threadpoolctl import threadpool_limits
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from resident_residual_cuda import DirectIQ4NLProjection, DirectQ4Projection, ResidentGateUp  # noqa: E402
+from resident_residual_cuda import DirectQ4Projection, ResidentGateUp  # noqa: E402
 from resident_residual_format import ResidentArtifact  # noqa: E402
+from sweep_mixed_down_kernel import build_projection  # noqa: E402
 
 
 def reference_dot(tensor, x):
@@ -59,9 +60,7 @@ def run_resident_ffn(layer_artifact: Path, *, repeats: int = 9, seed: int = 2026
             tensors = {item.name: item for item in reader.tensors}
             tensor = tensors[f"blk.{layer}.ffn_down.weight"]
             quant = GGMLQuantizationType(int(tensor.tensor_type))
-            if quant is GGMLQuantizationType.IQ4_NL:
-                down = DirectIQ4NLProjection(tensor.data, int(tensor.shape[0]))
-            elif quant is GGMLQuantizationType.Q4_K:
+            if quant is GGMLQuantizationType.Q4_K and down_kernel != "grouped":
                 down = DirectQ4Projection(
                     tensor.data,
                     int(tensor.shape[0]),
@@ -72,7 +71,12 @@ def run_resident_ffn(layer_artifact: Path, *, repeats: int = 9, seed: int = 2026
                     block_qblocks=down_block_qblocks,
                 )
             else:
-                raise ValueError(f"unsupported down tensor in v1 pipeline: {quant.name}")
+                down, _ = build_projection(
+                    tensor,
+                    block_rows=down_block_rows,
+                    num_warps=down_num_warps,
+                    block_qblocks=down_block_qblocks,
+                )
             with threadpool_limits(limits=cpu_threads):
                 g = reference_dot(tensors[f"blk.{layer}.ffn_gate.weight"], inputs[0])
                 u = reference_dot(tensors[f"blk.{layer}.ffn_up.weight"], inputs[0])

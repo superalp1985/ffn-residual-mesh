@@ -109,6 +109,36 @@ class ResidentFullFfnTests(unittest.TestCase):
             self.assertEqual(report["down_kernel_config"]["block_qblocks"], 4)
             self.assertLess(report["output_rel_l2"], 1e-5)
 
+    def test_full_ffn_supports_q5k_and_iq4xs_down(self):
+        import torch
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA unavailable")
+        from tests.gguf_fixture import write_fixture
+        from compile_resident_residual_artifact import compile_layer
+        from benchmark_resident_ffn_pipeline import run_resident_ffn
+
+        for quant, fixture_option in (("Q5_K", "q5k_down"), ("IQ4_XS", "iq4xs_down")):
+            with self.subTest(quant=quant), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                write_fixture(root / "fixture.gguf", **{fixture_option: True})
+                compile_layer(root / "fixture.gguf", 0, 4, root / "artifact")
+                report = run_resident_ffn(
+                    root / "artifact",
+                    repeats=3,
+                    cpu_threads=1,
+                    residual_kernel="grouped_fused",
+                    block_rows=8,
+                    residual_block_groups=16,
+                    down_block_qblocks=4,
+                    warmup_seconds=0.0,
+                )
+                self.assertEqual(report["down_quant_type"], quant)
+                self.assertEqual(report["down_kernel"], f"grouped_{quant.lower()}")
+                self.assertLess(report["output_rel_l2"], 1e-5)
+                self.assertEqual(report["dynamic_h2d_bytes"], 3072)
+                self.assertEqual(report["residual_weight_h2d_bytes_measured_delta"], 0)
+                self.assertIsNone(report["tokens_per_second"])
+
 
 if __name__ == "__main__":
     unittest.main()
