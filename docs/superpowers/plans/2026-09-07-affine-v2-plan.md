@@ -34,12 +34,12 @@ Q4-only tiled/graph paths must reject incompatible packages explicitly.
 
 - [x] Finish iteration 66 regression and current-factory numerical verification.
 - [x] Research upstream quantization layout before implementing.
-- [ ] Failing CPU artifact tests: Q5/mixed roundtrip, full range, metadata checks.
-- [ ] V2 compiler/reader and independent reconstruction tests.
-- [ ] Failing GPU tests: Q5/mixed grouped residual + CPU base + SwiGLU.
-- [ ] Grouped GPU high-plane decoding, V1 compatibility, unsupported-path guards.
-- [ ] Complete fixture FFN and real layers 24/25 with original Q5 down.
-- [ ] Full regression, byte/timing report, commit and push.
+- [x] CPU artifact tests: Q5/mixed roundtrip, full range, metadata checks.
+- [x] V2 compiler/reader and independent reconstruction tests.
+- [x] GPU tests: Q5/mixed grouped residual + CPU base + SwiGLU.
+- [x] Grouped GPU high-plane decoding, V1 compatibility, unsupported-path guards.
+- [x] Complete fixture FFN and real layers 24/25 with original Q5 down.
+- [x] Full regression, byte/timing report, commit and push.
 
 Measure current latency rather than copying iteration 66's earlier results.
 The fresh iteration 66 run showed large CPU/submission gaps, not a repeat of

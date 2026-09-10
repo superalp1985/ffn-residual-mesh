@@ -28,6 +28,7 @@ class TiledResidentGateUp:
         use_cuda_graph: bool = False,
         block_rows: int = 2,
         num_warps: int = 2,
+        base_block_groups: int = 256,
         pipeline_depth: int = 3,
         device: str | torch.device = "cuda",
     ) -> None:
@@ -44,10 +45,13 @@ class TiledResidentGateUp:
             raise ValueError("block_rows must be one of 1, 2, 4, 8")
         if num_warps not in (2, 4, 8):
             raise ValueError("num_warps must be 2, 4, or 8")
+        if base_block_groups not in (8, 16, 32, 64, 128, 256):
+            raise ValueError("base_block_groups must be one of 8, 16, 32, 64, 128, 256")
         if pipeline_depth < 1:
             raise ValueError("pipeline_depth must be positive")
         self.block_rows = int(block_rows)
         self.num_warps = int(num_warps)
+        self.base_block_groups = int(base_block_groups)
         self.rows = int(artifact.projections["gate"]["rows"])
         self.cols = int(artifact.projections["gate"]["cols"])
         self.plan = TilePlan(
@@ -163,6 +167,7 @@ class TiledResidentGateUp:
                 cols=self.cols,
                 block_rows=self.block_rows,
                 num_warps=self.num_warps,
+                block_groups=self.base_block_groups,
             )
             if down is not None:
                 down.launch(self.output["swiglu"])
@@ -188,6 +193,7 @@ class TiledResidentGateUp:
                 cols=self.cols,
                 block_rows=self.block_rows,
                 num_warps=self.num_warps,
+                block_groups=self.base_block_groups,
             )
             if down is not None:
                 down.launch(self.output["swiglu"])
@@ -282,6 +288,7 @@ class TiledResidentGateUp:
                     cols=self.cols,
                     block_rows=self.block_rows,
                     num_warps=self.num_warps,
+                    block_groups=self.base_block_groups,
                 )
                 end_event.record()
                 residual_end.record()
@@ -544,6 +551,7 @@ class TiledResidentGateUp:
                 cols=self.cols,
                 block_rows=self.block_rows,
                 num_warps=self.num_warps,
+                block_groups=self.base_block_groups,
             )
             if fused_end is not None:
                 fused_end.record()

@@ -1020,21 +1020,28 @@ def _fused_gate_up_base_residual_tiled(
             up_r * up_scale * activation[None, :], axis=1
         )
 
-    group = tl.arange(0, BLOCK_GROUPS)
-    group_mask = group < GROUPS
-    sums = tl.load(group_sums + group, mask=group_mask, other=0.0).to(tl.float32)
-    gate_c = tl.load(
-        gate_coeff + row[:, None] * GROUPS + group[None, :],
-        mask=row_mask[:, None] & group_mask[None, :],
-        other=0.0,
-    ).to(tl.float32)
-    up_c = tl.load(
-        up_coeff + row[:, None] * GROUPS + group[None, :],
-        mask=row_mask[:, None] & group_mask[None, :],
-        other=0.0,
-    ).to(tl.float32)
-    gate = gate_acc + tl.sum(gate_c * sums[None, :], axis=1)
-    up = up_acc + tl.sum(up_c * sums[None, :], axis=1)
+    gate_base_acc = tl.zeros((BLOCK_ROWS,), dtype=tl.float32)
+    up_base_acc = tl.zeros((BLOCK_ROWS,), dtype=tl.float32)
+    for group_start in range(0, GROUPS, BLOCK_GROUPS):
+        group = group_start + tl.arange(0, BLOCK_GROUPS)
+        group_mask = group < GROUPS
+        sums = tl.load(
+            group_sums + group, mask=group_mask, other=0.0
+        ).to(tl.float32)
+        gate_c = tl.load(
+            gate_coeff + row[:, None] * GROUPS + group[None, :],
+            mask=row_mask[:, None] & group_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        up_c = tl.load(
+            up_coeff + row[:, None] * GROUPS + group[None, :],
+            mask=row_mask[:, None] & group_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        gate_base_acc += tl.sum(gate_c * sums[None, :], axis=1)
+        up_base_acc += tl.sum(up_c * sums[None, :], axis=1)
+    gate = gate_acc + gate_base_acc
+    up = up_acc + up_base_acc
     tl.store(gate_output + row, gate, mask=row_mask)
     tl.store(up_output + row, up, mask=row_mask)
     tl.store(swiglu_output + row, gate * tl.sigmoid(gate) * up, mask=row_mask)
@@ -1173,7 +1180,8 @@ def launch_fused_gate_up_base_residual(
     block_rows: int = 1,
     num_warps: int = 8,
     block_cols: int = 512,
-) -> None:
+    block_groups: int = 256,
+) -> object:
     tensors = (
         gate_packed, gate_alpha, up_packed, up_alpha,
         gate_coeff, up_coeff, group_sums, device_x,
@@ -1196,14 +1204,17 @@ def launch_fused_gate_up_base_residual(
         raise ValueError("output shape does not match fused base/residual dimensions")
     if block_cols <= 0 or block_cols % 32:
         raise ValueError("block_cols must be a positive multiple of 32")
+    if block_groups not in (8, 16, 32, 64, 128, 256):
+        raise ValueError("block_groups must be one of 8, 16, 32, 64, 128, 256")
     block_cols = min(int(block_cols), cols)
-    _fused_gate_up_base_residual_tiled[(triton.cdiv(rows, block_rows),)](
+    block_groups = min(int(block_groups), groups)
+    return _fused_gate_up_base_residual_tiled[(triton.cdiv(rows, block_rows),)](
         gate_packed, gate_alpha, up_packed, up_alpha,
         gate_coeff, up_coeff, group_sums, device_x,
         gate_output, up_output, swiglu_output,
         ROWS=rows, COLS=cols, GROUPS=groups,
         BLOCK_ROWS=block_rows, BLOCK_COLS=block_cols,
-        BLOCK_GROUPS=triton.next_power_of_2(groups),
+        BLOCK_GROUPS=triton.next_power_of_2(block_groups),
         num_warps=num_warps, num_stages=2, enable_fp_fusion=True,
     )
 
