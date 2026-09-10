@@ -213,6 +213,7 @@ The repository now includes a separate baseline in which a worker stores a compl
 - `docs/release/ffn_residual_mesh_math_note_bingqin_wang.md`: short mathematical derivation signed by Bingqin WANG, suitable for a GitHub Release attachment.
 - `scripts/simulate_comfyui_phone_ffn.py`: H3/ComfyUI phone-link simulation.
 - `scripts/simulate_phone_ffn_cluster.py`: distributed FFN base-worker budget model.
+- `scripts/benchmark_resident_device_chain_graph.py`: fixed-address CUDA Graph replay benchmark for a resident multi-layer chain.
 - `src/phone_ffn_loopback.py`: framed worker protocol, checksum, concurrency, deadline, fallback.
 - `src/full_ffn_loopback.py`: complete FFN layer worker and direct numerical equivalence check.
 - `tests/`: correctness and protocol tests.
