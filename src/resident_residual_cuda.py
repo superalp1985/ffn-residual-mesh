@@ -1125,6 +1125,95 @@ def launch_fused_gate_up_tile(
     )
 
 
+@triton.jit
+def _fused_gate_up_base_residual_grouped_tiled(
+    gate_packed, gate_alpha, up_packed, up_alpha,
+    gate_coeff, up_coeff, group_sums, x,
+    gate_output, up_output, swiglu_output,
+    ROWS: tl.constexpr, COLS: tl.constexpr, GROUPS: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr, BLOCK_GROUPS: tl.constexpr,
+    GATE_BITS: tl.constexpr, UP_BITS: tl.constexpr,
+):
+    """Mixed Q4/Q5 resident gate/up path using the canonical group layout.
+
+    The Q4 super-tile kernel above is kept as the fast path.  Q5 residuals
+    use 20 bytes per 32-value group (16 low/high nibble bytes plus a
+    high-bit plane), so their packed row stride is not ``COLS // 2``.
+    Decoding by group keeps the exact affine split while supporting either
+    bitwidth independently for gate and up.
+    """
+    row = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    row_mask = row < ROWS
+    group_lane = tl.arange(0, BLOCK_GROUPS)
+    byte = tl.arange(0, 16)
+    gate_acc = tl.zeros((BLOCK_ROWS,), dtype=tl.float32)
+    up_acc = tl.zeros((BLOCK_ROWS,), dtype=tl.float32)
+
+    for group_start in range(0, GROUPS, BLOCK_GROUPS):
+        group = group_start + group_lane
+        group_mask = group < GROUPS
+        pair_mask = row_mask[:, None, None] & group_mask[None, :, None]
+        low_x = tl.load(
+            x + group[:, None] * 32 + byte[None, :] * 2,
+            mask=group_mask[:, None],
+            other=0.0,
+        )
+        high_x = tl.load(
+            x + group[:, None] * 32 + byte[None, :] * 2 + 1,
+            mask=group_mask[:, None],
+            other=0.0,
+        )
+
+        gate_low, gate_high = _load_residual_pair(
+            gate_packed, row, group, byte, pair_mask,
+            GROUPS=GROUPS, BITS=GATE_BITS,
+        )
+        up_low, up_high = _load_residual_pair(
+            up_packed, row, group, byte, pair_mask,
+            GROUPS=GROUPS, BITS=UP_BITS,
+        )
+        gate_scale = tl.load(
+            gate_alpha + row[:, None] * GROUPS + group[None, :],
+            mask=row_mask[:, None] & group_mask[None, :],
+            other=0.0,
+        )
+        up_scale = tl.load(
+            up_alpha + row[:, None] * GROUPS + group[None, :],
+            mask=row_mask[:, None] & group_mask[None, :],
+            other=0.0,
+        )
+        gate_dot = tl.sum(
+            (gate_low * low_x[None, :, :] + gate_high * high_x[None, :, :])
+            * gate_scale[:, :, None],
+            axis=2,
+        )
+        up_dot = tl.sum(
+            (up_low * low_x[None, :, :] + up_high * high_x[None, :, :])
+            * up_scale[:, :, None],
+            axis=2,
+        )
+        gate_acc += tl.sum(gate_dot, axis=1)
+        up_acc += tl.sum(up_dot, axis=1)
+
+        sums = tl.load(group_sums + group, mask=group_mask, other=0.0)
+        gate_c = tl.load(
+            gate_coeff + row[:, None] * GROUPS + group[None, :],
+            mask=row_mask[:, None] & group_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        up_c = tl.load(
+            up_coeff + row[:, None] * GROUPS + group[None, :],
+            mask=row_mask[:, None] & group_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        gate_acc += tl.sum(gate_c * sums[None, :], axis=1)
+        up_acc += tl.sum(up_c * sums[None, :], axis=1)
+
+    tl.store(gate_output + row, gate_acc, mask=row_mask)
+    tl.store(up_output + row, up_acc, mask=row_mask)
+    tl.store(swiglu_output + row, gate_acc * tl.sigmoid(gate_acc) * up_acc, mask=row_mask)
+
+
 def launch_fused_gate_up_residual_tile(
     gate_packed: torch.Tensor,
     gate_alpha: torch.Tensor,
@@ -1138,6 +1227,9 @@ def launch_fused_gate_up_residual_tile(
     cols: int,
     block_rows: int = 1,
     num_warps: int = 8,
+    gate_bits: int = 4,
+    up_bits: int = 4,
+    block_groups: int = 32,
 ) -> None:
     tensors = (
         gate_packed, gate_alpha, up_packed, up_alpha,
@@ -1147,17 +1239,32 @@ def launch_fused_gate_up_residual_tile(
         raise ValueError("fused residual tile requires CUDA tensors")
     if rows < 1 or cols < 32 or cols % 32 or block_rows not in (1, 2, 4, 8):
         raise ValueError("invalid fused residual tile dimensions")
-    if gate_packed.shape != (rows, cols // 2) or up_packed.shape != (rows, cols // 2):
+    if gate_bits not in (4, 5) or up_bits not in (4, 5):
+        raise ValueError("supported residual bitwidths are 4/5")
+    if gate_packed.shape != (rows, cols * gate_bits // 8) or up_packed.shape != (rows, cols * up_bits // 8):
         raise ValueError("packed shape does not match fused residual tile dimensions")
     if gate_alpha.shape != (rows, cols // 32) or up_alpha.shape != (rows, cols // 32):
         raise ValueError("alpha shape does not match fused residual tile dimensions")
     if device_x.numel() != cols or gate_output.numel() != rows or up_output.numel() != rows:
         raise ValueError("activation/output shape does not match fused residual tile")
-    _fused_gate_up_residual_tile[(triton.cdiv(rows, block_rows),)](
+    if gate_bits == 4 and up_bits == 4:
+        _fused_gate_up_residual_tile[(triton.cdiv(rows, block_rows),)](
+            gate_packed, gate_alpha, up_packed, up_alpha, device_x,
+            gate_output, up_output,
+            ROWS=rows, COLS=cols,
+            BLOCK_ROWS=block_rows, BLOCK_COLS=triton.next_power_of_2(cols),
+            num_warps=num_warps, enable_fp_fusion=False,
+        )
+        return
+    if block_groups not in (8, 16, 32, 64, 128, 256):
+        raise ValueError("block_groups must be one of 8, 16, 32, 64, 128, 256")
+    _fused_gate_up_residual_grouped[(triton.cdiv(rows, block_rows),)](
         gate_packed, gate_alpha, up_packed, up_alpha, device_x,
         gate_output, up_output,
         ROWS=rows, COLS=cols,
-        BLOCK_ROWS=block_rows, BLOCK_COLS=triton.next_power_of_2(cols),
+        BLOCK_ROWS=block_rows,
+        BLOCK_GROUPS=triton.next_power_of_2(min(int(block_groups), cols // 32)),
+        GATE_BITS=gate_bits, UP_BITS=up_bits,
         num_warps=num_warps, enable_fp_fusion=False,
     )
 
@@ -1181,6 +1288,8 @@ def launch_fused_gate_up_base_residual(
     num_warps: int = 8,
     block_cols: int = 512,
     block_groups: int = 256,
+    gate_bits: int = 4,
+    up_bits: int = 4,
 ) -> object:
     tensors = (
         gate_packed, gate_alpha, up_packed, up_alpha,
@@ -1192,7 +1301,9 @@ def launch_fused_gate_up_base_residual(
     groups = cols // 32
     if rows < 1 or cols < 32 or cols % 32 or block_rows not in (1, 2, 4, 8):
         raise ValueError("invalid fused base/residual dimensions")
-    if gate_packed.shape != (rows, cols // 2) or up_packed.shape != (rows, cols // 2):
+    if gate_bits not in (4, 5) or up_bits not in (4, 5):
+        raise ValueError("supported residual bitwidths are 4/5")
+    if gate_packed.shape != (rows, cols * gate_bits // 8) or up_packed.shape != (rows, cols * up_bits // 8):
         raise ValueError("packed shape does not match fused base/residual dimensions")
     if gate_alpha.shape != (rows, groups) or up_alpha.shape != (rows, groups):
         raise ValueError("alpha shape does not match fused base/residual dimensions")
@@ -1206,6 +1317,20 @@ def launch_fused_gate_up_base_residual(
         raise ValueError("block_cols must be a positive multiple of 32")
     if block_groups not in (8, 16, 32, 64, 128, 256):
         raise ValueError("block_groups must be one of 8, 16, 32, 64, 128, 256")
+    if gate_bits != 4 or up_bits != 4:
+        groups = cols // 32
+        return _fused_gate_up_base_residual_grouped_tiled[
+            (triton.cdiv(rows, block_rows),)
+        ](
+            gate_packed, gate_alpha, up_packed, up_alpha,
+            gate_coeff, up_coeff, group_sums, device_x,
+            gate_output, up_output, swiglu_output,
+            ROWS=rows, COLS=cols, GROUPS=groups,
+            BLOCK_ROWS=block_rows,
+            BLOCK_GROUPS=triton.next_power_of_2(min(int(block_groups), groups)),
+            GATE_BITS=gate_bits, UP_BITS=up_bits,
+            num_warps=num_warps, enable_fp_fusion=False,
+        )
     block_cols = min(int(block_cols), cols)
     block_groups = min(int(block_groups), groups)
     return _fused_gate_up_base_residual_tiled[(triton.cdiv(rows, block_rows),)](

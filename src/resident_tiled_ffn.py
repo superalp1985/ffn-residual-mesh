@@ -15,6 +15,27 @@ from resident_tile_cache import ResidentTileCache
 from resident_tile_plan import TilePlan
 
 
+def resolve_q5_base_schedule(
+    bits: dict[str, int],
+    *,
+    block_rows: int,
+    num_warps: int,
+    base_block_groups: int,
+    auto_tune_q5_base: bool,
+) -> tuple[int, int, int, bool]:
+    """Resolve the safe default launch shape for Q5/mixed grouped decoding."""
+    requested = (int(block_rows), int(num_warps), int(base_block_groups))
+    resolved = list(requested)
+    if auto_tune_q5_base and any(int(value) == 5 for value in bits.values()):
+        # Q5 grouped decoding has a much higher register footprint than the
+        # Q4 super-tile path. The legacy 256-group launch can serialize it.
+        if block_rows == 2 and num_warps == 2:
+            resolved[0] = 4
+        if base_block_groups == 256:
+            resolved[2] = 16
+    return (*resolved, tuple(resolved) != requested)
+
+
 class TiledResidentGateUp:
     """Exact gate/up + SwiGLU path using row-tiled resident residuals."""
 
@@ -29,11 +50,17 @@ class TiledResidentGateUp:
         block_rows: int = 2,
         num_warps: int = 2,
         base_block_groups: int = 256,
+        residual_block_groups: int = 32,
+        auto_tune_q5_base: bool = True,
         pipeline_depth: int = 3,
         device: str | torch.device = "cuda",
     ) -> None:
-        if any(artifact.residual_bits(name) != 4 for name in ("gate", "up")):
-            raise ValueError("tiled execution currently supports Q4 residual packing only")
+        self.bits = {
+            name: int(artifact.residual_bits(name))
+            for name in ("gate", "up")
+        }
+        if any(bits not in (4, 5) for bits in self.bits.values()):
+            raise ValueError("tiled execution supports Q4/Q5 residual packing only")
         if not torch.cuda.is_available():
             raise RuntimeError("TiledResidentGateUp requires CUDA")
         self.artifact = artifact
@@ -47,11 +74,29 @@ class TiledResidentGateUp:
             raise ValueError("num_warps must be 2, 4, or 8")
         if base_block_groups not in (8, 16, 32, 64, 128, 256):
             raise ValueError("base_block_groups must be one of 8, 16, 32, 64, 128, 256")
+        if residual_block_groups not in (8, 16, 32, 64, 128, 256):
+            raise ValueError(
+                "residual_block_groups must be one of 8, 16, 32, 64, 128, 256"
+            )
         if pipeline_depth < 1:
             raise ValueError("pipeline_depth must be positive")
-        self.block_rows = int(block_rows)
-        self.num_warps = int(num_warps)
-        self.base_block_groups = int(base_block_groups)
+        self.requested_block_rows = int(block_rows)
+        self.requested_num_warps = int(num_warps)
+        self.requested_base_block_groups = int(base_block_groups)
+        self.auto_tune_q5_base = bool(auto_tune_q5_base)
+        (
+            self.block_rows,
+            self.num_warps,
+            self.base_block_groups,
+            self.base_schedule_auto_tuned,
+        ) = resolve_q5_base_schedule(
+            self.bits,
+            block_rows=block_rows,
+            num_warps=num_warps,
+            base_block_groups=base_block_groups,
+            auto_tune_q5_base=self.auto_tune_q5_base,
+        )
+        self.residual_block_groups = int(residual_block_groups)
         self.rows = int(artifact.projections["gate"]["rows"])
         self.cols = int(artifact.projections["gate"]["cols"])
         self.plan = TilePlan(
@@ -69,6 +114,7 @@ class TiledResidentGateUp:
         tile_bytes = self.plan.tile_bytes(
             cols=self.cols,
             alpha_cols=self.cols // 32,
+            residual_bits=self.bits,
         )
         # Keep three transient tiles available so copy and compute can run as
         # a producer/consumer ring. Persistent layers do not need staging.
@@ -78,7 +124,11 @@ class TiledResidentGateUp:
             arrays,
             plan=self.plan,
             vram_budget_bytes=(
-                self.plan.total_bytes(cols=self.cols, alpha_cols=self.cols // 32)
+                self.plan.total_bytes(
+                    cols=self.cols,
+                    alpha_cols=self.cols // 32,
+                    residual_bits=self.bits,
+                )
                 if self._persistent else tile_bytes * staging_slots
             ),
             device=self.device,
@@ -168,6 +218,8 @@ class TiledResidentGateUp:
                 block_rows=self.block_rows,
                 num_warps=self.num_warps,
                 block_groups=self.base_block_groups,
+                gate_bits=self.bits["gate"],
+                up_bits=self.bits["up"],
             )
             if down is not None:
                 down.launch(self.output["swiglu"])
@@ -194,6 +246,8 @@ class TiledResidentGateUp:
                 block_rows=self.block_rows,
                 num_warps=self.num_warps,
                 block_groups=self.base_block_groups,
+                gate_bits=self.bits["gate"],
+                up_bits=self.bits["up"],
             )
             if down is not None:
                 down.launch(self.output["swiglu"])
@@ -289,6 +343,8 @@ class TiledResidentGateUp:
                     block_rows=self.block_rows,
                     num_warps=self.num_warps,
                     block_groups=self.base_block_groups,
+                    gate_bits=self.bits["gate"],
+                    up_bits=self.bits["up"],
                 )
                 end_event.record()
                 residual_end.record()
@@ -345,6 +401,9 @@ class TiledResidentGateUp:
                         cols=self.cols,
                         block_rows=self.block_rows,
                         num_warps=self.num_warps,
+                        gate_bits=self.bits["gate"],
+                        up_bits=self.bits["up"],
+                        block_groups=self.residual_block_groups,
                     )
                     end_event.record()
                 tile_events.append((begin_event, end_event))
@@ -552,6 +611,8 @@ class TiledResidentGateUp:
                 block_rows=self.block_rows,
                 num_warps=self.num_warps,
                 block_groups=self.base_block_groups,
+                gate_bits=self.bits["gate"],
+                up_bits=self.bits["up"],
             )
             if fused_end is not None:
                 fused_end.record()

@@ -161,6 +161,7 @@ def benchmark(
                 with TiledResidentGateUp(
                     artifact, tile_rows=int(artifact.projections["gate"]["rows"]),
                     persistent=True, base_on_gpu=True, base_block_groups=groups,
+                    auto_tune_q5_base=False,
                 ) as runner:
                     kernel_graph, capture_ms = _capture_kernel_graph(runner, x, groups)
                     full_graph, full_capture_ms = _capture_kernel_graph(

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Iterable, Mapping
 
 
 @dataclass(frozen=True)
@@ -38,17 +38,50 @@ class TilePlan:
     def tile_slices(self) -> list[tuple[int, int]]:
         return self.ranges()
 
-    def tile_bytes(self, *, cols: int, alpha_cols: int, tile_rows: int | None = None) -> int:
+    def tile_bytes(
+        self,
+        *,
+        cols: int,
+        alpha_cols: int,
+        tile_rows: int | None = None,
+        residual_bits: int | Mapping[str, int] = 4,
+    ) -> int:
         if cols < 1 or cols % 2 or alpha_cols < 1:
             raise ValueError("invalid payload dimensions")
         height = self.tile_rows if tile_rows is None else int(tile_rows)
         if height < 1 or height > self.tile_rows:
             raise ValueError("invalid tile height")
-        per_projection = height * (cols // 2) + height * alpha_cols * 4
-        return len(self.projections) * per_projection
-
-    def total_bytes(self, *, cols: int, alpha_cols: int) -> int:
+        if isinstance(residual_bits, Mapping):
+            bits_by_projection = {
+                projection: int(residual_bits[projection])
+                for projection in self.projections
+            }
+        else:
+            bits_by_projection = {
+                projection: int(residual_bits)
+                for projection in self.projections
+            }
+        if any(bits not in (4, 5) for bits in bits_by_projection.values()):
+            raise ValueError("residual_bits must be 4 or 5")
         return sum(
-            self.tile_bytes(cols=cols, alpha_cols=alpha_cols, tile_rows=stop - start)
+            height * (cols * bits_by_projection[projection] // 8)
+            + height * alpha_cols * 4
+            for projection in self.projections
+        )
+
+    def total_bytes(
+        self,
+        *,
+        cols: int,
+        alpha_cols: int,
+        residual_bits: int | Mapping[str, int] = 4,
+    ) -> int:
+        return sum(
+            self.tile_bytes(
+                cols=cols,
+                alpha_cols=alpha_cols,
+                tile_rows=stop - start,
+                residual_bits=residual_bits,
+            )
             for start, stop in self.ranges()
         )

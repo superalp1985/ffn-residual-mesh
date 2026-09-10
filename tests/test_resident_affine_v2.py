@@ -145,7 +145,7 @@ class AffineV2CudaTests(unittest.TestCase):
                         self.assertEqual(runner.traffic["dynamic_h2d_bytes"], 2 * (256 + 512) * 4)
                         self.assertEqual(runner.traffic["weight_h2d_bytes_per_run"], 0)
 
-    def test_q5_is_rejected_by_q4_only_execution_paths(self):
+    def test_q5_and_mixed_gate_up_are_supported_by_tiled_execution(self):
         from resident_residual_cuda import ResidentGateUp
         from resident_tiled_ffn import TiledResidentGateUp
 
@@ -156,8 +156,16 @@ class AffineV2CudaTests(unittest.TestCase):
             with ResidentArtifact.open(root / "artifact") as artifact:
                 with self.assertRaisesRegex(ValueError, "grouped"):
                     ResidentGateUp(artifact, residual_kernel="legacy")
-                with self.assertRaisesRegex(ValueError, "Q4"):
-                    TiledResidentGateUp(artifact)
+                runner = TiledResidentGateUp(artifact, tile_rows=256)
+                self.assertEqual(runner.bits, {"gate": 5, "up": 4})
+                self.assertEqual(
+                    runner.cache.cache.scheduler.layer_bytes(0),
+                    artifact.arrays["gate"]["residual"].nbytes
+                    + artifact.arrays["up"]["residual"].nbytes
+                    + artifact.arrays["gate"]["alpha"].nbytes
+                    + artifact.arrays["up"]["alpha"].nbytes,
+                )
+                runner.close()
 
     def test_full_ffn_with_q5_and_mixed_gate_up(self):
         from benchmark_resident_ffn_pipeline import run_resident_ffn

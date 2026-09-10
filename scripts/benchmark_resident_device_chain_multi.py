@@ -201,6 +201,17 @@ def benchmark(
                 "base_h2d_bytes_per_layer": [0] * len(layers),
                 "resident_weight_h2d_bytes_per_layer": [0] * len(layers),
                 "down_kernel_config_per_layer": down_metadata,
+                "gate_up_kernel_config_per_layer": [
+                    {
+                        "block_rows": runner.block_rows,
+                        "num_warps": runner.num_warps,
+                        "base_block_groups": runner.base_block_groups,
+                        "requested_block_rows": runner.requested_block_rows,
+                        "requested_base_block_groups": runner.requested_base_block_groups,
+                        "auto_tuned": runner.base_schedule_auto_tuned,
+                    }
+                    for runner in runners
+                ],
                 "kernel_mode": "device_activation_fused_base_residual_swiglu",
                 "device": torch.cuda.get_device_name(),
                 "torch": torch.__version__,
