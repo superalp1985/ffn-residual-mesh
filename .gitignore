@@ -27,6 +27,7 @@ results/**/*.json
 results/**/*.csv
 results/**/*.npz
 results/**/*.txt
+artifacts/**
 logs/*.log
 
 # Vendored local runtimes/source snapshots
