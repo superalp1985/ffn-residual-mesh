@@ -17,7 +17,14 @@ from resident_tiled_ffn import TiledResidentGateUp  # noqa: E402
 from sweep_mixed_down_kernel import build_projection  # noqa: E402
 
 
-def make_down(model: Path, layer: int):
+def make_down(
+    model: Path,
+    layer: int,
+    *,
+    block_rows: int = 2,
+    num_warps: int = 2,
+    block_qblocks: int = 4,
+):
     reader = GGUFReader(model)
     try:
         tensor = next(
@@ -26,11 +33,17 @@ def make_down(model: Path, layer: int):
         )
         projection, _ = build_projection(
             tensor,
-            block_rows=2,
-            num_warps=2,
-            block_qblocks=4,
+            block_rows=block_rows,
+            num_warps=num_warps,
+            block_qblocks=block_qblocks,
         )
-        return projection
+        return projection, {
+            "block_rows": block_rows,
+            "num_warps": num_warps,
+            "block_qblocks": block_qblocks,
+            "kernel": getattr(projection, "kernel", "iq4_nl_fused"),
+            "quant_type": projection.__class__.__name__,
+        }
     finally:
         reader.data._mmap.close()
 
@@ -45,6 +58,12 @@ def benchmark(
     warmup: int,
     repeats: int,
     seed: int,
+    first_down_block_rows: int = 2,
+    first_down_num_warps: int = 2,
+    first_down_block_qblocks: int = 4,
+    second_down_block_rows: int = 2,
+    second_down_num_warps: int = 2,
+    second_down_block_qblocks: int = 4,
 ) -> dict[str, object]:
     if warmup < 1 or repeats < 3:
         raise ValueError("warmup must be positive and repeats must be at least 3")
@@ -64,8 +83,20 @@ def benchmark(
             persistent=True,
             base_on_gpu=True,
         )
-        down_first = make_down(model, first_layer)
-        down_second = make_down(model, second_layer)
+        down_first, first_down_config = make_down(
+            model,
+            first_layer,
+            block_rows=first_down_block_rows,
+            num_warps=first_down_num_warps,
+            block_qblocks=first_down_block_qblocks,
+        )
+        down_second, second_down_config = make_down(
+            model,
+            second_layer,
+            block_rows=second_down_block_rows,
+            num_warps=second_down_num_warps,
+            block_qblocks=second_down_block_qblocks,
+        )
         try:
             rng = np.random.default_rng(seed)
             x = torch.from_numpy(
@@ -190,6 +221,10 @@ def benchmark(
                 "activation_d2d_bytes_per_layer": [0, 0],
                 "base_h2d_bytes_per_layer": [0, 0],
                 "resident_weight_h2d_bytes_per_layer": [0, 0],
+                "down_kernel_config_per_layer": [
+                    first_down_config,
+                    second_down_config,
+                ],
                 "first_kernel_mode": "device_activation_fused_base_residual_swiglu",
                 "second_kernel_mode": "device_activation_fused_base_residual_swiglu",
                 "device": torch.cuda.get_device_name(),
@@ -218,6 +253,12 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--repeats", type=int, default=7)
     parser.add_argument("--seed", type=int, default=20260906)
+    parser.add_argument("--first-down-block-rows", type=int, choices=(1, 2, 4, 8), default=2)
+    parser.add_argument("--first-down-num-warps", type=int, choices=(2, 4, 8), default=2)
+    parser.add_argument("--first-down-block-qblocks", type=int, choices=(1, 2, 4), default=4)
+    parser.add_argument("--second-down-block-rows", type=int, choices=(1, 2, 4, 8), default=2)
+    parser.add_argument("--second-down-num-warps", type=int, choices=(2, 4, 8), default=2)
+    parser.add_argument("--second-down-block-qblocks", type=int, choices=(1, 2, 4), default=4)
     parser.add_argument("--out", type=Path)
     args = parser.parse_args()
     report = benchmark(
@@ -229,6 +270,12 @@ def main() -> None:
         warmup=args.warmup,
         repeats=args.repeats,
         seed=args.seed,
+        first_down_block_rows=args.first_down_block_rows,
+        first_down_num_warps=args.first_down_num_warps,
+        first_down_block_qblocks=args.first_down_block_qblocks,
+        second_down_block_rows=args.second_down_block_rows,
+        second_down_num_warps=args.second_down_num_warps,
+        second_down_block_qblocks=args.second_down_block_qblocks,
     )
     text = json.dumps(report, indent=2)
     print(text)
