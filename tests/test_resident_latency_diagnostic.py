@@ -180,6 +180,78 @@ class ResidentLatencyDiagnosticTests(unittest.TestCase):
             self.assertEqual(len(candidate["samples_ms"]), 3)
             self.assertIn("split_r4_w2_g16_contiguous_x", report["stage_profile"]["variants"])
 
+    def test_fp16_base_reports_approximation_without_relaxing_exact_threshold(self):
+        import torch
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA unavailable")
+        from compile_resident_residual_artifact import compile_layer
+        from diagnose_resident_latency import benchmark
+        from tests.gguf_fixture import write_fixture
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_fixture(root / "model.gguf", gate_up_types=("Q5_K", "Q4_K"), q5k_down=True)
+            compile_layer(root / "model.gguf", 0, None, root / "artifact", format_version=2)
+            report = benchmark(
+                root / "artifact", repeats=3, inner=2, warmup_seconds=0.01,
+                compare_fp16_base=True, profile_stages=True, validation_inputs=3,
+            )
+            base = report["variants"]["split_r4_w2_g16"]
+            candidate = report["variants"]["split_r4_w2_g16_fp16_base"]
+            self.assertEqual(candidate["kind"], "approximate_fp16_base_affine_split")
+            self.assertEqual(base["config"]["base_dtype"], "float32")
+            self.assertEqual(candidate["config"]["base_dtype"], "float16")
+            self.assertEqual(base["base_resident_bytes"], 16384)
+            self.assertEqual(candidate["base_resident_bytes"], 8192)
+            self.assertEqual(base["weight_bytes"] - candidate["weight_bytes"], 8192)
+            self.assertEqual(candidate["validation_threshold_relative_l2"], 1e-4)
+            self.assertGreater(candidate["max_reference_absolute_error"], 0)
+            self.assertLess(candidate["max_reference_relative_l2"], 4e-3)
+            self.assertEqual(
+                candidate["validation_passed"],
+                candidate["max_reference_relative_l2"] < 1e-4,
+            )
+            self.assertTrue(base["validation_passed"])
+            self.assertEqual(
+                report["validation_passed"],
+                all(v["validation_passed"] for v in report["variants"].values()),
+            )
+            self.assertGreater(candidate["kernel_resources"]["registers_per_thread"], 0)
+            self.assertIn("split_r4_w2_g16_fp16_base", report["stage_profile"]["variants"])
+
+    def test_validation_rejects_nonfinite_result_after_a_finite_result(self):
+        import numpy as np
+        import torch
+        from unittest.mock import patch
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA unavailable")
+        from compile_resident_residual_artifact import compile_layer
+        from diagnose_resident_latency import benchmark, _reference_ffn
+        from tests.gguf_fixture import write_fixture
+
+        calls = 0
+
+        def faulty_reference(*args, **kwargs):
+            nonlocal calls
+            result = _reference_ffn(*args, **kwargs)
+            calls += 1
+            if calls == 2:
+                result[0] = np.nan
+            return result
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_fixture(root / "model.gguf", q4k_down=True)
+            compile_layer(root / "model.gguf", 0, 4, root / "artifact")
+            with patch("diagnose_resident_latency._reference_ffn", side_effect=faulty_reference):
+                report = benchmark(
+                    root / "artifact", repeats=1, inner=1, warmup_seconds=0,
+                    validation_inputs=2,
+                )
+            self.assertFalse(report["validation_passed"])
+            for variant in report["variants"].values():
+                self.assertFalse(variant["validation_passed"])
+
 
 if __name__ == "__main__":
     unittest.main()

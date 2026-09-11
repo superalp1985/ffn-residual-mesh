@@ -46,6 +46,19 @@ def _relative_l2(actual: torch.Tensor, reference: torch.Tensor) -> float:
     )
 
 
+def _max_absolute_error(actual: torch.Tensor, reference: torch.Tensor) -> float:
+    actual_host = actual.detach().cpu().numpy().astype(np.float64, copy=False)
+    reference_host = reference.detach().cpu().numpy().astype(np.float64, copy=False)
+    return float(np.max(np.abs(actual_host - reference_host)))
+
+
+def _validation_passed(errors: list[float], threshold: float = 1e-4) -> bool:
+    return bool(errors) and all(
+        math.isfinite(float(value)) and float(value) < threshold
+        for value in errors
+    )
+
+
 def _validate_protocol(
     *,
     repeats: int,
@@ -365,6 +378,7 @@ def benchmark(
     profile_stages: bool = False,
     compare_scale_reduction: bool = False,
     compare_contiguous_x: bool = False,
+    compare_fp16_base: bool = False,
 ) -> dict[str, object]:
     _validate_protocol(
         repeats=repeats,
@@ -441,14 +455,17 @@ def benchmark(
                         "base_block_groups": block_groups,
                         "scale_after_reduce": False,
                         "contiguous_x": False,
+                        "base_dtype": "float32",
                     },
                 }
                 candidates = []
                 if compare_scale_reduction:
-                    candidates.append(("_scale_after", True, False))
+                    candidates.append(("_scale_after", True, False, "float32"))
                 if compare_contiguous_x:
-                    candidates.append(("_contiguous_x", False, True))
-                for suffix, scale_after_reduce, contiguous_x in candidates:
+                    candidates.append(("_contiguous_x", False, True, "float32"))
+                if compare_fp16_base:
+                    candidates.append(("_fp16_base", False, False, "float16"))
+                for suffix, scale_after_reduce, contiguous_x, base_dtype in candidates:
                     candidate_runner = TiledResidentGateUp(
                         artifact,
                         tile_rows=rows,
@@ -458,6 +475,7 @@ def benchmark(
                         num_warps=num_warps,
                         base_block_groups=block_groups,
                         auto_tune_q5_base=False,
+                        base_dtype=base_dtype,
                     )
                     runners.append(candidate_runner)
                     candidate_x = torch.from_numpy(timed_input.copy()).cuda()
@@ -486,6 +504,7 @@ def benchmark(
                             "base_block_groups": block_groups,
                             "scale_after_reduce": scale_after_reduce,
                             "contiguous_x": contiguous_x,
+                            "base_dtype": base_dtype,
                         },
                     }
 
@@ -537,6 +556,9 @@ def benchmark(
             reference_errors: dict[str, list[float]] = {
                 name: [] for name in all_names
             }
+            reference_absolute_errors: dict[str, list[float]] = {
+                name: [] for name in all_names
+            }
             for value in validation:
                 reference = torch.from_numpy(
                     _reference_ffn(gate_up_raw, down_raw, value)
@@ -545,6 +567,9 @@ def benchmark(
                 native_result = native_output.detach().clone()
                 native_errors.append(_relative_l2(native_result, reference))
                 reference_errors["native"].append(native_errors[-1])
+                reference_absolute_errors["native"].append(
+                    _max_absolute_error(native_output, reference)
+                )
                 for name, entry in split_entries.items():
                     _replay_with_input(
                         entry["graph"],
@@ -558,6 +583,9 @@ def benchmark(
                     reference_errors[name].append(
                         _relative_l2(entry["output"], reference)
                     )
+                    reference_absolute_errors[name].append(
+                        _max_absolute_error(entry["output"], reference)
+                    )
 
             variants: dict[str, dict[str, object]] = {
                 "native": {
@@ -567,6 +595,9 @@ def benchmark(
                     "samples_ms": samples["native"],
                     "max_relative_l2": max(native_errors),
                     "max_reference_relative_l2": max(reference_errors["native"]),
+                    "max_reference_absolute_error": max(reference_absolute_errors["native"]),
+                    "validation_threshold_relative_l2": 1e-4,
+                    "validation_passed": _validation_passed(reference_errors["native"]),
                     "comparison_reference": "gguf_dequantized_fp64",
                     "validation_inputs": validation_inputs,
                     "weight_bytes": int(
@@ -591,18 +622,30 @@ def benchmark(
                         else 0
                     )
                 )
+                base_dtype = entry["config"].get("base_dtype", "float32")
                 variants[name] = {
-                    "kind": "exact_centered_affine_split",
+                    "kind": (
+                        "approximate_fp16_base_affine_split"
+                        if base_dtype == "float16"
+                        else "exact_centered_affine_split"
+                    ),
                     "config": entry["config"],
                     "median_ms": float(np.median(samples[name])),
                     "p95_ms": float(np.percentile(samples[name], 95)),
                     "samples_ms": samples[name],
                     "max_relative_l2": max(split_errors[name]),
                     "max_reference_relative_l2": max(reference_errors[name]),
+                    "max_reference_absolute_error": max(reference_absolute_errors[name]),
+                    "validation_threshold_relative_l2": 1e-4,
+                    "validation_passed": _validation_passed(reference_errors[name]),
                     "comparison_reference": "native_gpu",
                     "validation_inputs": validation_inputs,
                     "weight_bytes": split_weight_bytes,
                     "kernel_resources": _kernel_resources(entry["kernel"]),
+                    "base_resident_bytes": sum(
+                        value.numel() * value.element_size()
+                        for value in runner.base_resident.values()
+                    ),
                 }
 
             native_weight_bytes = int(
@@ -634,9 +677,7 @@ def benchmark(
                 "stage_profile": stage_profile,
                 "reference_kind": "gguf_dequantized_fp64",
                 "validation_passed": all(
-                    math.isfinite(value) and value < 1e-4
-                    for errors in reference_errors.values()
-                    for value in errors
+                    variant["validation_passed"] for variant in variants.values()
                 ),
                 "native_weight_bytes": native_weight_bytes,
                 "split_weight_bytes": split_weight_bytes,
@@ -687,6 +728,7 @@ def main() -> None:
     parser.add_argument("--profile-stages", action="store_true")
     parser.add_argument("--compare-scale-reduction", action="store_true")
     parser.add_argument("--compare-contiguous-x", action="store_true")
+    parser.add_argument("--compare-fp16-base", action="store_true")
     parser.add_argument("--seed", type=int, default=20260911)
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
@@ -701,6 +743,7 @@ def main() -> None:
         profile_stages=args.profile_stages,
         compare_scale_reduction=args.compare_scale_reduction,
         compare_contiguous_x=args.compare_contiguous_x,
+        compare_fp16_base=args.compare_fp16_base,
     )
     text = json.dumps(report, indent=2)
     args.out.parent.mkdir(parents=True, exist_ok=True)

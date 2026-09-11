@@ -37,7 +37,11 @@ def resolve_q5_base_schedule(
 
 
 class TiledResidentGateUp:
-    """Exact gate/up + SwiGLU path using row-tiled resident residuals."""
+    """Affine gate/up + SwiGLU with exact residual codes.
+
+    FP32 base storage is the default. Opt-in FP16 storage adds coefficient
+    rounding and is supported only by the full-layer fused GPU-base path.
+    """
 
     def __init__(
         self,
@@ -53,6 +57,7 @@ class TiledResidentGateUp:
         residual_block_groups: int = 32,
         auto_tune_q5_base: bool = True,
         pipeline_depth: int = 3,
+        base_dtype: str | torch.dtype = "float32",
         device: str | torch.device = "cuda",
     ) -> None:
         self.bits = {
@@ -66,6 +71,22 @@ class TiledResidentGateUp:
         self.artifact = artifact
         self.device = torch.device(device)
         self.base_on_gpu = bool(base_on_gpu)
+        if isinstance(base_dtype, str):
+            base_dtype_key = base_dtype.strip().lower()
+            dtype_map = {
+                "float32": torch.float32, "fp32": torch.float32,
+                "float16": torch.float16, "fp16": torch.float16,
+            }
+            try:
+                self.base_dtype = dtype_map[base_dtype_key]
+            except KeyError as exc:
+                raise ValueError("base_dtype must be float32 or float16") from exc
+        elif base_dtype in (torch.float32, torch.float16):
+            self.base_dtype = base_dtype
+        else:
+            raise ValueError("base_dtype must be float32 or float16")
+        if not self.base_on_gpu and self.base_dtype != torch.float32:
+            raise ValueError("base_dtype applies only when base_on_gpu=True")
         self.use_cuda_graph = bool(use_cuda_graph)
         self._persistent = bool(persistent)
         if block_rows not in (1, 2, 4, 8):
@@ -104,6 +125,16 @@ class TiledResidentGateUp:
             tile_rows=tile_rows,
             projections=("gate", "up"),
         )
+        if self.base_dtype == torch.float16 and len(self.plan.tile_slices()) != 1:
+            raise ValueError("float16 base_dtype requires a full-layer resident path")
+        if self.base_dtype == torch.float16:
+            for name in ("gate", "up"):
+                coefficient = np.asarray(artifact.arrays[name]["coefficient"])
+                if (
+                    not np.isfinite(coefficient).all()
+                    or np.any(np.abs(coefficient) > np.finfo(np.float16).max)
+                ):
+                    raise ValueError("base coefficient is not finite FP16")
         arrays = {
             name: {
                 "residual": artifact.arrays[name]["residual"],
@@ -153,11 +184,13 @@ class TiledResidentGateUp:
         self.base_accum = {}
         self.device_group_sums = None
         if self.base_on_gpu:
-            # Coefficients are static and paid for once at cold start. FP32 is
-            # sufficient for the split residual tolerance and avoids slow FP64
-            # GEMV on consumer GPUs.
+            # Storage conversion is paid once at cold start. Fused kernels
+            # widen FP16 coefficients to FP32 before multiplying/accumulating.
             for name in ("gate", "up"):
-                coefficient = np.asarray(artifact.arrays[name]["coefficient"], dtype=np.float32)
+                coefficient = np.asarray(
+                    artifact.arrays[name]["coefficient"],
+                    dtype=np.float16 if self.base_dtype == torch.float16 else np.float32,
+                )
                 self.base_resident[name] = torch.from_numpy(
                     np.array(coefficient, copy=True)
                 ).to(self.device)

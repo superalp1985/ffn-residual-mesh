@@ -196,6 +196,144 @@ class TiledResidentFfnTests(unittest.TestCase):
                 cpu_runner.close()
                 gpu_runner.close()
 
+    def test_gpu_base_fp16_coefficients_reduce_resident_bytes(self) -> None:
+        import torch
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA unavailable")
+        from tests.gguf_fixture import write_fixture
+        from compile_resident_residual_artifact import compile_layer
+        from resident_residual_format import ResidentArtifact
+        from resident_tiled_ffn import TiledResidentGateUp
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_fixture(root / "fixture.gguf")
+            compile_layer(root / "fixture.gguf", 0, 4, root / "artifact")
+            with ResidentArtifact.open(root / "artifact") as artifact:
+                fp32 = TiledResidentGateUp(
+                    artifact, tile_rows=256, persistent=True, base_on_gpu=True
+                )
+                fp16 = TiledResidentGateUp(
+                    artifact, tile_rows=256, persistent=True, base_on_gpu=True,
+                    base_dtype="float16",
+                )
+                x = np.random.default_rng(581).standard_normal(256).astype(np.float32)
+                out32 = fp32.run(x)
+                out16 = fp16.run(x)
+                self.assertEqual(fp32.base_resident["gate"].dtype, torch.float32)
+                self.assertEqual(fp16.base_resident["gate"].dtype, torch.float16)
+                self.assertEqual(
+                    out16["base_resident_bytes"],
+                    out32["base_resident_bytes"] // 2,
+                )
+                for name, tolerance in (("gate", 3e-3), ("up", 3e-3), ("swiglu", 4e-3)):
+                    error = np.linalg.norm(out16[name] - out32[name]) / max(
+                        np.linalg.norm(out32[name]), 1e-8
+                    )
+                    self.assertLess(float(error), tolerance)
+                fp32.close()
+                fp16.close()
+
+    def test_fp16_base_rejects_multitile_and_nonfinite_storage(self) -> None:
+        import torch
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA unavailable")
+        from tests.gguf_fixture import write_fixture
+        from compile_resident_residual_artifact import compile_layer
+        from resident_residual_format import ResidentArtifact
+        from resident_tiled_ffn import TiledResidentGateUp
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_fixture(root / "fixture.gguf")
+            compile_layer(root / "fixture.gguf", 0, 4, root / "artifact")
+            with ResidentArtifact.open(root / "artifact") as artifact:
+                for options, message in (
+                    ({"tile_rows": 64}, "full-layer"),
+                    ({"base_on_gpu": False}, "base_on_gpu"),
+                    ({"base_dtype": "int8"}, "base_dtype"),
+                ):
+                    arguments = dict(
+                        tile_rows=256, persistent=True, base_on_gpu=True,
+                        base_dtype="float16",
+                    )
+                    arguments.update(options)
+                    with self.subTest(options=options), self.assertRaisesRegex(
+                        ValueError, message
+                    ):
+                        with TiledResidentGateUp(artifact, **arguments):
+                            pass
+                original = artifact.arrays["gate"]["coefficient"]
+                try:
+                    for value in (70000.0, float("inf"), float("nan")):
+                        coefficient = np.array(original, copy=True)
+                        coefficient[0, 0] = value
+                        artifact.arrays["gate"]["coefficient"] = coefficient
+                        with self.subTest(value=value), self.assertRaisesRegex(
+                            ValueError, "finite FP16"
+                        ):
+                            with TiledResidentGateUp(
+                                artifact, tile_rows=256, persistent=True,
+                                base_on_gpu=True, base_dtype="float16",
+                            ):
+                                pass
+                finally:
+                    artifact.arrays["gate"]["coefficient"] = original
+
+    def test_fp16_base_matches_rounding_correction_reference(self) -> None:
+        import torch
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA unavailable")
+        from gguf import GGUFReader
+        from gguf.quants import dequantize
+        from tests.gguf_fixture import write_fixture
+        from compile_resident_residual_artifact import compile_layer
+        from resident_residual_format import ResidentArtifact
+        from resident_tiled_ffn import TiledResidentGateUp
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for types in (("Q4_K", "Q4_K"), ("Q5_K", "Q5_K"), ("Q5_K", "Q4_K")):
+                with self.subTest(types=types):
+                    model = root / f"{types[0]}_{types[1]}.gguf"
+                    compiled = root / f"{types[0]}_{types[1]}"
+                    write_fixture(model, gate_up_types=types)
+                    compile_layer(model, 0, None, compiled, format_version=2)
+                    reader = GGUFReader(model)
+                    try:
+                        tensors = {t.name: t for t in reader.tensors}
+                        weights = {
+                            name: dequantize(
+                                tensors[f"blk.0.ffn_{name}.weight"].data,
+                                tensors[f"blk.0.ffn_{name}.weight"].tensor_type,
+                            ).astype(np.float64)
+                            for name in ("gate", "up")
+                        }
+                    finally:
+                        reader.data._mmap.close()
+                    with ResidentArtifact.open(compiled) as artifact, TiledResidentGateUp(
+                        artifact, tile_rows=256, persistent=True, base_on_gpu=True,
+                        base_dtype="float16", use_cuda_graph=True,
+                    ) as runner:
+                        before = runner.cache.traffic["weight_h2d_bytes"]
+                        for seed in (581, 582, 583):
+                            x = np.random.default_rng(seed).standard_normal(256).astype(np.float32)
+                            expected = {}
+                            sums = x.astype(np.float64).reshape(-1, 32).sum(axis=1)
+                            for name in ("gate", "up"):
+                                coefficient = np.asarray(artifact.arrays[name]["coefficient"])
+                                rounding = coefficient.astype(np.float16).astype(np.float64) - coefficient
+                                expected[name] = weights[name] @ x + rounding @ sums
+                            gate, up = expected["gate"], expected["up"]
+                            expected["swiglu"] = gate * np.exp(-np.logaddexp(0, -gate)) * up
+                            outputs = (runner.run(x), runner.run_device(torch.from_numpy(x).cuda()))
+                            for output in outputs:
+                                for name in ("gate", "up", "swiglu"):
+                                    np.testing.assert_allclose(
+                                        output[name], expected[name], rtol=2e-4, atol=2e-4
+                                    )
+                            self.assertEqual(runner.cache.traffic["weight_h2d_bytes"], before)
+
     def test_cuda_graph_replay_accepts_new_activation_and_preserves_output(self) -> None:
         import torch
         if not torch.cuda.is_available():
