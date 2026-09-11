@@ -101,6 +101,50 @@ class ResidentLatencyDiagnosticTests(unittest.TestCase):
                 atol=1e-9,
             )
 
+    def test_scale_reduction_comparison_measures_complete_ffn(self):
+        import torch
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA unavailable")
+        from compile_resident_residual_artifact import compile_layer
+        from diagnose_resident_latency import benchmark
+        from tests.gguf_fixture import write_fixture
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_fixture(root / "model.gguf", gate_up_types=("Q5_K", "Q5_K"), q5k_down=True)
+            compile_layer(root / "model.gguf", 0, None, root / "artifact", format_version=2)
+            report = benchmark(
+                root / "artifact", repeats=3, inner=2, warmup_seconds=0.01,
+                compare_scale_reduction=True, profile_stages=True,
+            )
+            self.assertTrue(report["validation_passed"])
+            base = report["variants"]["split_r4_w2_g16"]
+            candidate = report["variants"]["split_r4_w2_g16_scale_after"]
+            self.assertEqual(base["weight_bytes"], candidate["weight_bytes"])
+            self.assertGreater(candidate["kernel_resources"]["registers_per_thread"], 0)
+            self.assertLess(candidate["max_reference_relative_l2"], 1e-4)
+            self.assertTrue(candidate["config"]["scale_after_reduce"])
+            self.assertEqual(len(candidate["samples_ms"]), 3)
+            self.assertIn("split_r4_w2_g16_scale_after", report["stage_profile"]["variants"])
+
+    def test_scale_reduction_comparison_rejects_pure_q4(self):
+        import torch
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA unavailable")
+        from compile_resident_residual_artifact import compile_layer
+        from diagnose_resident_latency import benchmark
+        from tests.gguf_fixture import write_fixture
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_fixture(root / "model.gguf", gate_up_types=("Q4_K", "Q4_K"), q4k_down=True)
+            compile_layer(root / "model.gguf", 0, None, root / "artifact", format_version=2)
+            with self.assertRaisesRegex(ValueError, "requires at least one Q5"):
+                benchmark(
+                    root / "artifact", repeats=1, inner=1, warmup_seconds=0.01,
+                    compare_scale_reduction=True,
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

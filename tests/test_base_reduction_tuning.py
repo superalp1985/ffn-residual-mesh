@@ -135,6 +135,57 @@ class BaseReductionTuningTests(unittest.TestCase):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 sweep.benchmark(Path("does-not-exist"), **kwargs)
 
+    def test_scale_after_reduce_preserves_mixed_residuals_and_tail_rows(self):
+        import torch
+        from resident_residual_cuda import launch_fused_gate_up_base_residual
+
+        rng = np.random.default_rng(7801)
+        rows, cols = 13, 1280
+        groups = cols // 32
+        x = rng.standard_normal(cols).astype(np.float32)
+        device_x = torch.from_numpy(x).cuda()
+        sums = device_x.reshape(groups, 32).sum(dim=1)
+        for bits in ((5, 5), (5, 4), (4, 5)):
+            operands, expected = [], []
+            for width in bits:
+                signed = rng.integers(
+                    -(1 << (width - 1)), 1 << (width - 1),
+                    (rows, groups, 32), dtype=np.int16,
+                )
+                low = ((signed[:, :, 0::2] & 15)
+                       | ((signed[:, :, 1::2] & 15) << 4)).astype(np.uint8)
+                if width == 5:
+                    high = np.packbits(
+                        ((signed & 31) >> 4).astype(np.uint8),
+                        axis=-1, bitorder="little",
+                    )
+                    low = np.concatenate((low, high), axis=-1)
+                alpha = (rng.standard_normal((rows, groups)) * 0.01).astype(np.float32)
+                coefficient = (rng.standard_normal((rows, groups)) * 0.02).astype(np.float32)
+                operands.append([
+                    torch.from_numpy(value.copy()).cuda()
+                    for value in (low.reshape(rows, -1), alpha, coefficient)
+                ])
+                weights = signed.astype(np.float64) * alpha[:, :, None] + coefficient[:, :, None]
+                expected.append(weights.reshape(rows, cols) @ x)
+            expected.append(
+                expected[0] * np.exp(-np.logaddexp(0, -expected[0])) * expected[1]
+            )
+            outputs = [torch.empty(rows, device="cuda") for _ in range(3)]
+            for block_rows, warps, block_groups in ((4, 2, 16), (8, 4, 8)):
+                with self.subTest(bits=bits, block_rows=block_rows):
+                    launch_fused_gate_up_base_residual(
+                        operands[0][0], operands[0][1], operands[1][0], operands[1][1],
+                        operands[0][2], operands[1][2], sums, device_x, *outputs,
+                        rows=rows, cols=cols, block_rows=block_rows, num_warps=warps,
+                        block_groups=block_groups, gate_bits=bits[0], up_bits=bits[1],
+                        scale_after_reduce=True,
+                    )
+                    for actual, reference in zip(outputs, expected):
+                        np.testing.assert_allclose(
+                            actual.cpu().numpy(), reference, rtol=5e-5, atol=5e-5,
+                        )
+
 
 if __name__ == "__main__":
     unittest.main()

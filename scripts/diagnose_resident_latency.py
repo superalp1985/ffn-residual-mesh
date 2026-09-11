@@ -179,14 +179,17 @@ def _capture_split_graph(
     x: torch.Tensor,
     *,
     stage_events: dict[str, torch.cuda.Event] | None = None,
-) -> tuple[torch.cuda.CUDAGraph, torch.cuda.Stream, torch.Tensor]:
+    scale_after_reduce: bool = False,
+) -> tuple[torch.cuda.CUDAGraph, torch.cuda.Stream, torch.Tensor, object]:
     package = runner.cache.package(0)
     if package is None or runner.device_group_sums is None:
         raise RuntimeError("persistent split runner did not retain its resident package")
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
+    compiled_kernel = None
 
     def launch() -> None:
+        nonlocal compiled_kernel
         if stage_events is not None:
             stage_events["begin"].record()
         torch.sum(
@@ -195,7 +198,7 @@ def _capture_split_graph(
             dtype=torch.float32,
             out=runner.device_group_sums,
         )
-        launch_fused_gate_up_base_residual(
+        compiled_kernel = launch_fused_gate_up_base_residual(
             package["gate.residual"],
             package["gate.alpha"],
             package["up.residual"],
@@ -214,6 +217,7 @@ def _capture_split_graph(
             block_groups=runner.base_block_groups,
             gate_bits=runner.bits["gate"],
             up_bits=runner.bits["up"],
+            scale_after_reduce=scale_after_reduce,
         )
         if stage_events is not None:
             stage_events["gate_up_end"].record()
@@ -228,7 +232,14 @@ def _capture_split_graph(
     with torch.cuda.graph(graph, stream=stream):
         launch()
     stream.synchronize()
-    return graph, stream, down.output
+    return graph, stream, down.output, compiled_kernel
+
+
+def _kernel_resources(compiled_kernel: object) -> dict[str, int]:
+    return {
+        "registers_per_thread": int(getattr(compiled_kernel, "n_regs", 0)),
+        "spills": int(getattr(compiled_kernel, "n_spills", 0)),
+    }
 
 
 def _graph_ms(
@@ -284,8 +295,14 @@ def _profile_stages(
             buffers.append(owned)
         else:
             entry = split_entries[name]
-            graph, stream, _ = _capture_split_graph(
-                entry["runner"], entry["down"], entry["x"], stage_events=events
+            graph, stream, _, _ = _capture_split_graph(
+                entry["runner"],
+                entry["down"],
+                entry["x"],
+                stage_events=events,
+                scale_after_reduce=bool(
+                    entry["config"].get("scale_after_reduce", False)
+                ),
             )
         graphs[name] = (graph, stream, events)
     warmup_end = time.perf_counter() + warmup_seconds
@@ -343,6 +360,7 @@ def benchmark(
     seed: int = 20260911,
     validation_inputs: int = 2,
     profile_stages: bool = False,
+    compare_scale_reduction: bool = False,
 ) -> dict[str, object]:
     _validate_protocol(
         repeats=repeats,
@@ -367,6 +385,12 @@ def benchmark(
 
         rows = int(artifact.projections["gate"]["rows"])
         cols = int(artifact.projections["gate"]["cols"])
+        gate_bits = int(artifact.residual_bits("gate"))
+        up_bits = int(artifact.residual_bits("up"))
+        if compare_scale_reduction and gate_bits == 4 and up_bits == 4:
+            raise ValueError(
+                "scale_after_reduce comparison requires at least one Q5 gate/up residual"
+            )
         rng = np.random.default_rng(seed)
         timed_input = rng.standard_normal(cols).astype(np.float32)
         validation = [
@@ -395,7 +419,9 @@ def benchmark(
                 runners.append(runner)
                 split_down, _ = build_projection(down_raw)
                 split_x = torch.from_numpy(timed_input.copy()).cuda()
-                graph, stream, output = _capture_split_graph(runner, split_down, split_x)
+                graph, stream, output, kernel = _capture_split_graph(
+                    runner, split_down, split_x
+                )
                 name = f"split_r{block_rows}_w{num_warps}_g{block_groups}"
                 split_entries[name] = {
                     "runner": runner,
@@ -404,12 +430,52 @@ def benchmark(
                     "graph": graph,
                     "stream": stream,
                     "output": output,
+                    "kernel": kernel,
                     "config": {
                         "block_rows": block_rows,
                         "num_warps": num_warps,
                         "base_block_groups": block_groups,
+                        "scale_after_reduce": False,
                     },
                 }
+                if compare_scale_reduction:
+                    candidate_runner = TiledResidentGateUp(
+                        artifact,
+                        tile_rows=rows,
+                        persistent=True,
+                        base_on_gpu=True,
+                        block_rows=block_rows,
+                        num_warps=num_warps,
+                        base_block_groups=block_groups,
+                        auto_tune_q5_base=False,
+                    )
+                    runners.append(candidate_runner)
+                    candidate_x = torch.from_numpy(timed_input.copy()).cuda()
+                    candidate_name = f"{name}_scale_after"
+                    candidate_down, _ = build_projection(down_raw)
+                    candidate_graph, candidate_stream, candidate_output, candidate_kernel = (
+                        _capture_split_graph(
+                            candidate_runner,
+                            candidate_down,
+                            candidate_x,
+                            scale_after_reduce=True,
+                        )
+                    )
+                    split_entries[candidate_name] = {
+                        "runner": candidate_runner,
+                        "down": candidate_down,
+                        "x": candidate_x,
+                        "graph": candidate_graph,
+                        "stream": candidate_stream,
+                        "output": candidate_output,
+                        "kernel": candidate_kernel,
+                        "config": {
+                            "block_rows": block_rows,
+                            "num_warps": num_warps,
+                            "base_block_groups": block_groups,
+                            "scale_after_reduce": True,
+                        },
+                    }
 
             graphs: dict[str, tuple[torch.cuda.CUDAGraph, torch.cuda.Stream]] = {
                 "native": (native_graph, native_stream)
@@ -524,6 +590,7 @@ def benchmark(
                     "comparison_reference": "native_gpu",
                     "validation_inputs": validation_inputs,
                     "weight_bytes": split_weight_bytes,
+                    "kernel_resources": _kernel_resources(entry["kernel"]),
                 }
 
             native_weight_bytes = int(
@@ -606,6 +673,7 @@ def main() -> None:
     parser.add_argument("--configs", type=_parse_configs, default=((4, 2, 16),))
     parser.add_argument("--validation-inputs", type=int, default=2)
     parser.add_argument("--profile-stages", action="store_true")
+    parser.add_argument("--compare-scale-reduction", action="store_true")
     parser.add_argument("--seed", type=int, default=20260911)
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
@@ -618,6 +686,7 @@ def main() -> None:
         validation_inputs=args.validation_inputs,
         seed=args.seed,
         profile_stages=args.profile_stages,
+        compare_scale_reduction=args.compare_scale_reduction,
     )
     text = json.dumps(report, indent=2)
     args.out.parent.mkdir(parents=True, exist_ok=True)

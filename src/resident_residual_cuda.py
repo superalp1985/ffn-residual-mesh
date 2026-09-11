@@ -1133,6 +1133,7 @@ def _fused_gate_up_base_residual_grouped_tiled(
     ROWS: tl.constexpr, COLS: tl.constexpr, GROUPS: tl.constexpr,
     BLOCK_ROWS: tl.constexpr, BLOCK_GROUPS: tl.constexpr,
     GATE_BITS: tl.constexpr, UP_BITS: tl.constexpr,
+    SCALE_AFTER_REDUCE: tl.constexpr,
 ):
     """Mixed Q4/Q5 resident gate/up path using the canonical group layout.
 
@@ -1182,16 +1183,26 @@ def _fused_gate_up_base_residual_grouped_tiled(
             mask=row_mask[:, None] & group_mask[None, :],
             other=0.0,
         )
-        gate_dot = tl.sum(
-            (gate_low * low_x[None, :, :] + gate_high * high_x[None, :, :])
-            * gate_scale[:, :, None],
-            axis=2,
-        )
-        up_dot = tl.sum(
-            (up_low * low_x[None, :, :] + up_high * high_x[None, :, :])
-            * up_scale[:, :, None],
-            axis=2,
-        )
+        if SCALE_AFTER_REDUCE:
+            gate_dot = tl.sum(
+                gate_low * low_x[None, :, :] + gate_high * high_x[None, :, :],
+                axis=2,
+            ) * gate_scale
+            up_dot = tl.sum(
+                up_low * low_x[None, :, :] + up_high * high_x[None, :, :],
+                axis=2,
+            ) * up_scale
+        else:
+            gate_dot = tl.sum(
+                (gate_low * low_x[None, :, :] + gate_high * high_x[None, :, :])
+                * gate_scale[:, :, None],
+                axis=2,
+            )
+            up_dot = tl.sum(
+                (up_low * low_x[None, :, :] + up_high * high_x[None, :, :])
+                * up_scale[:, :, None],
+                axis=2,
+            )
         gate_acc += tl.sum(gate_dot, axis=1)
         up_acc += tl.sum(up_dot, axis=1)
 
@@ -1290,6 +1301,7 @@ def launch_fused_gate_up_base_residual(
     block_groups: int = 256,
     gate_bits: int = 4,
     up_bits: int = 4,
+    scale_after_reduce: bool = False,
 ) -> object:
     tensors = (
         gate_packed, gate_alpha, up_packed, up_alpha,
@@ -1329,6 +1341,7 @@ def launch_fused_gate_up_base_residual(
             BLOCK_ROWS=block_rows,
             BLOCK_GROUPS=triton.next_power_of_2(min(int(block_groups), groups)),
             GATE_BITS=gate_bits, UP_BITS=up_bits,
+            SCALE_AFTER_REDUCE=bool(scale_after_reduce),
             num_warps=num_warps, enable_fp_fusion=False,
         )
     block_cols = min(int(block_cols), cols)
