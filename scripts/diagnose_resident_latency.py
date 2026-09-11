@@ -180,6 +180,7 @@ def _capture_split_graph(
     *,
     stage_events: dict[str, torch.cuda.Event] | None = None,
     scale_after_reduce: bool = False,
+    contiguous_x: bool = False,
 ) -> tuple[torch.cuda.CUDAGraph, torch.cuda.Stream, torch.Tensor, object]:
     package = runner.cache.package(0)
     if package is None or runner.device_group_sums is None:
@@ -218,6 +219,7 @@ def _capture_split_graph(
             gate_bits=runner.bits["gate"],
             up_bits=runner.bits["up"],
             scale_after_reduce=scale_after_reduce,
+            contiguous_x=contiguous_x,
         )
         if stage_events is not None:
             stage_events["gate_up_end"].record()
@@ -303,6 +305,7 @@ def _profile_stages(
                 scale_after_reduce=bool(
                     entry["config"].get("scale_after_reduce", False)
                 ),
+                contiguous_x=bool(entry["config"].get("contiguous_x", False)),
             )
         graphs[name] = (graph, stream, events)
     warmup_end = time.perf_counter() + warmup_seconds
@@ -361,6 +364,7 @@ def benchmark(
     validation_inputs: int = 2,
     profile_stages: bool = False,
     compare_scale_reduction: bool = False,
+    compare_contiguous_x: bool = False,
 ) -> dict[str, object]:
     _validate_protocol(
         repeats=repeats,
@@ -387,9 +391,9 @@ def benchmark(
         cols = int(artifact.projections["gate"]["cols"])
         gate_bits = int(artifact.residual_bits("gate"))
         up_bits = int(artifact.residual_bits("up"))
-        if compare_scale_reduction and gate_bits == 4 and up_bits == 4:
+        if (compare_scale_reduction or compare_contiguous_x) and gate_bits == 4 and up_bits == 4:
             raise ValueError(
-                "scale_after_reduce comparison requires at least one Q5 gate/up residual"
+                "grouped kernel comparison requires at least one Q5 gate/up residual"
             )
         rng = np.random.default_rng(seed)
         timed_input = rng.standard_normal(cols).astype(np.float32)
@@ -436,9 +440,15 @@ def benchmark(
                         "num_warps": num_warps,
                         "base_block_groups": block_groups,
                         "scale_after_reduce": False,
+                        "contiguous_x": False,
                     },
                 }
+                candidates = []
                 if compare_scale_reduction:
+                    candidates.append(("_scale_after", True, False))
+                if compare_contiguous_x:
+                    candidates.append(("_contiguous_x", False, True))
+                for suffix, scale_after_reduce, contiguous_x in candidates:
                     candidate_runner = TiledResidentGateUp(
                         artifact,
                         tile_rows=rows,
@@ -451,14 +461,15 @@ def benchmark(
                     )
                     runners.append(candidate_runner)
                     candidate_x = torch.from_numpy(timed_input.copy()).cuda()
-                    candidate_name = f"{name}_scale_after"
+                    candidate_name = f"{name}{suffix}"
                     candidate_down, _ = build_projection(down_raw)
                     candidate_graph, candidate_stream, candidate_output, candidate_kernel = (
                         _capture_split_graph(
                             candidate_runner,
                             candidate_down,
                             candidate_x,
-                            scale_after_reduce=True,
+                            scale_after_reduce=scale_after_reduce,
+                            contiguous_x=contiguous_x,
                         )
                     )
                     split_entries[candidate_name] = {
@@ -473,7 +484,8 @@ def benchmark(
                             "block_rows": block_rows,
                             "num_warps": num_warps,
                             "base_block_groups": block_groups,
-                            "scale_after_reduce": True,
+                            "scale_after_reduce": scale_after_reduce,
+                            "contiguous_x": contiguous_x,
                         },
                     }
 
@@ -674,6 +686,7 @@ def main() -> None:
     parser.add_argument("--validation-inputs", type=int, default=2)
     parser.add_argument("--profile-stages", action="store_true")
     parser.add_argument("--compare-scale-reduction", action="store_true")
+    parser.add_argument("--compare-contiguous-x", action="store_true")
     parser.add_argument("--seed", type=int, default=20260911)
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
@@ -687,6 +700,7 @@ def main() -> None:
         seed=args.seed,
         profile_stages=args.profile_stages,
         compare_scale_reduction=args.compare_scale_reduction,
+        compare_contiguous_x=args.compare_contiguous_x,
     )
     text = json.dumps(report, indent=2)
     args.out.parent.mkdir(parents=True, exist_ok=True)

@@ -33,6 +33,11 @@ class BaseReductionTuningTests(unittest.TestCase):
             inspect.signature(TiledResidentGateUp).parameters["base_block_groups"].default,
             256,
         )
+        for name in ("scale_after_reduce", "contiguous_x"):
+            self.assertIs(
+                inspect.signature(launch_fused_gate_up_base_residual).parameters[name].default,
+                False,
+            )
 
     def test_base_group_tiles_preserve_all_rows_and_groups(self):
         import torch
@@ -136,6 +141,15 @@ class BaseReductionTuningTests(unittest.TestCase):
                 sweep.benchmark(Path("does-not-exist"), **kwargs)
 
     def test_scale_after_reduce_preserves_mixed_residuals_and_tail_rows(self):
+        self._assert_grouped_variant(scale_after_reduce=True)
+
+    def test_contiguous_activation_load_preserves_q5_mixed_residuals(self):
+        self._assert_grouped_variant(contiguous_x=True)
+
+    def test_contiguous_activation_load_with_scale_after_reduce(self):
+        self._assert_grouped_variant(contiguous_x=True, scale_after_reduce=True)
+
+    def _assert_grouped_variant(self, **flags):
         import torch
         from resident_residual_cuda import launch_fused_gate_up_base_residual
 
@@ -179,13 +193,12 @@ class BaseReductionTuningTests(unittest.TestCase):
                         operands[0][2], operands[1][2], sums, device_x, *outputs,
                         rows=rows, cols=cols, block_rows=block_rows, num_warps=warps,
                         block_groups=block_groups, gate_bits=bits[0], up_bits=bits[1],
-                        scale_after_reduce=True,
+                        **flags,
                     )
                     for actual, reference in zip(outputs, expected):
                         np.testing.assert_allclose(
                             actual.cpu().numpy(), reference, rtol=5e-5, atol=5e-5,
                         )
-
 
 if __name__ == "__main__":
     unittest.main()

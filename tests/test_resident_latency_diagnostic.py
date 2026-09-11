@@ -139,11 +139,46 @@ class ResidentLatencyDiagnosticTests(unittest.TestCase):
             root = Path(directory)
             write_fixture(root / "model.gguf", gate_up_types=("Q4_K", "Q4_K"), q4k_down=True)
             compile_layer(root / "model.gguf", 0, None, root / "artifact", format_version=2)
-            with self.assertRaisesRegex(ValueError, "requires at least one Q5"):
-                benchmark(
-                    root / "artifact", repeats=1, inner=1, warmup_seconds=0.01,
-                    compare_scale_reduction=True,
-                )
+            for options in (
+                {"compare_scale_reduction": True},
+                {"compare_contiguous_x": True},
+            ):
+                with self.subTest(options=options), self.assertRaisesRegex(
+                    ValueError, "requires at least one Q5"
+                ):
+                    benchmark(
+                        root / "artifact", repeats=1, inner=1, warmup_seconds=0.01,
+                        **options,
+                    )
+
+    def test_contiguous_activation_comparison_measures_complete_ffn(self):
+        import torch
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA unavailable")
+        from compile_resident_residual_artifact import compile_layer
+        from diagnose_resident_latency import benchmark
+        from tests.gguf_fixture import write_fixture
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_fixture(root / "model.gguf", gate_up_types=("Q5_K", "Q4_K"), q5k_down=True)
+            compile_layer(root / "model.gguf", 0, None, root / "artifact", format_version=2)
+            report = benchmark(
+                root / "artifact", repeats=3, inner=2, warmup_seconds=0.01,
+                compare_scale_reduction=True, compare_contiguous_x=True,
+                profile_stages=True,
+            )
+            self.assertTrue(report["validation_passed"])
+            base = report["variants"]["split_r4_w2_g16"]
+            candidate = report["variants"]["split_r4_w2_g16_contiguous_x"]
+            self.assertEqual(len(report["variants"]), 4)
+            self.assertEqual(base["weight_bytes"], candidate["weight_bytes"])
+            self.assertFalse(base["config"]["contiguous_x"])
+            self.assertTrue(candidate["config"]["contiguous_x"])
+            self.assertFalse(candidate["config"]["scale_after_reduce"])
+            self.assertLess(candidate["max_reference_relative_l2"], 1e-4)
+            self.assertEqual(len(candidate["samples_ms"]), 3)
+            self.assertIn("split_r4_w2_g16_contiguous_x", report["stage_profile"]["variants"])
 
 
 if __name__ == "__main__":

@@ -1133,7 +1133,7 @@ def _fused_gate_up_base_residual_grouped_tiled(
     ROWS: tl.constexpr, COLS: tl.constexpr, GROUPS: tl.constexpr,
     BLOCK_ROWS: tl.constexpr, BLOCK_GROUPS: tl.constexpr,
     GATE_BITS: tl.constexpr, UP_BITS: tl.constexpr,
-    SCALE_AFTER_REDUCE: tl.constexpr,
+    SCALE_AFTER_REDUCE: tl.constexpr, CONTIGUOUS_X: tl.constexpr,
 ):
     """Mixed Q4/Q5 resident gate/up path using the canonical group layout.
 
@@ -1154,16 +1154,26 @@ def _fused_gate_up_base_residual_grouped_tiled(
         group = group_start + group_lane
         group_mask = group < GROUPS
         pair_mask = row_mask[:, None, None] & group_mask[None, :, None]
-        low_x = tl.load(
-            x + group[:, None] * 32 + byte[None, :] * 2,
-            mask=group_mask[:, None],
-            other=0.0,
-        )
-        high_x = tl.load(
-            x + group[:, None] * 32 + byte[None, :] * 2 + 1,
-            mask=group_mask[:, None],
-            other=0.0,
-        )
+        if CONTIGUOUS_X:
+            lane = tl.arange(0, 32)
+            x_group = tl.load(
+                x + group[:, None] * 32 + lane[None, :],
+                mask=group_mask[:, None],
+                other=0.0,
+            )
+            x_pairs = tl.reshape(x_group, (BLOCK_GROUPS, 16, 2))
+            low_x, high_x = tl.split(x_pairs)
+        else:
+            low_x = tl.load(
+                x + group[:, None] * 32 + byte[None, :] * 2,
+                mask=group_mask[:, None],
+                other=0.0,
+            )
+            high_x = tl.load(
+                x + group[:, None] * 32 + byte[None, :] * 2 + 1,
+                mask=group_mask[:, None],
+                other=0.0,
+            )
 
         gate_low, gate_high = _load_residual_pair(
             gate_packed, row, group, byte, pair_mask,
@@ -1302,6 +1312,7 @@ def launch_fused_gate_up_base_residual(
     gate_bits: int = 4,
     up_bits: int = 4,
     scale_after_reduce: bool = False,
+    contiguous_x: bool = False,
 ) -> object:
     tensors = (
         gate_packed, gate_alpha, up_packed, up_alpha,
@@ -1342,6 +1353,7 @@ def launch_fused_gate_up_base_residual(
             BLOCK_GROUPS=triton.next_power_of_2(min(int(block_groups), groups)),
             GATE_BITS=gate_bits, UP_BITS=up_bits,
             SCALE_AFTER_REDUCE=bool(scale_after_reduce),
+            CONTIGUOUS_X=bool(contiguous_x),
             num_warps=num_warps, enable_fp_fusion=False,
         )
     block_cols = min(int(block_cols), cols)
